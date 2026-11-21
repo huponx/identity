@@ -1,0 +1,27 @@
+application:
+  deployment:
+    replicas: 2
+    container:
+      image:
+        tag: "v2026.08.1-release-e1f4018"
+  ingress:
+    enabled: true
+    host: auth.example.com
+    tls: true
+    tlsSecretName: auth-example-tls
+  secrets:
+    - name: POSTGRES_PASSWORD
+      secretName: identity-postgres
+      key: password
+    - name: REDIS_PASSWORD
+      secretName: redis-local-credentials
+      key: password
+    - name: IDENTITY_MFA_KEY
+      secretName: identity-mfa-key
+      key: keys
+  config:
+    data:
+      IDENTITY_ISSUER: https://auth.example.com
+      IDENTITY_SIGNING_KEY_ID: k1
+      POSTGRES_HOST: postgres.infrastructure.svc.cluster.local
+      REDIS_HOST: redis.infrastructure.svc.cluster.local
