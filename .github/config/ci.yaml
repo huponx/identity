@@ -10,7 +10,7 @@ apps:
           image-tag-paths:
             - .application.deployment.container.image.tag
           trivy:
-            severity: "LOW,MEDIUM,HIGH,CRITICAL"
+            severity: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
             ignore-unfixed: true
             exit-code: 0   # report only: the CVEs are listed in the PR comment, the build does not fail
 global:
@@ -31,5 +31,5 @@ global:
       labels: [automerge]
     production:
       workflows: [production]
-      enabled: false
+      enabled: true
       labels: [automerge]

@@ -5,17 +5,25 @@
 # the only one an ingress exposes).
 application:
   deployment:
+    # The image runs as the distroless `nonroot` user (65532). Secret files are owned by root, so
+    # the pod needs an fsGroup: the kubelet then gives the files that group, and mode 0440 lets it
+    # read them. With mode 0400 and no fsGroup the key is unreadable ("permission denied").
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
+      runAsGroup: 65532
+      fsGroup: 65532
     volumes:
       - name: signing-key
         secret:
           secretName: identity-signing-key
-          defaultMode: 0400
+          defaultMode: 0440
       # retired keys after a rotation: one entry per key, named <kid>.pem; optional, may not exist
       - name: previous-keys
         secret:
           secretName: identity-previous-keys
           optional: true
-          defaultMode: 0400
+          defaultMode: 0440
       - name: courier-token
         projected:
           sources:
