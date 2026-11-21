@@ -1,0 +1,15 @@
+/bin/
+*.exe
+*.test
+*.out
+coverage.*
+.env
+.env.*
+!.env.example
+go.work
+go.work.sum
+/dev-keys/
+
+# helm dependencies (helm dependency build)
+charts/*/charts/
+charts/*/*.tgz

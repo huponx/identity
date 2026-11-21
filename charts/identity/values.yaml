@@ -1,0 +1,110 @@
+# Values of the go-application chart live under `application:` (alias of the dependency).
+# image.tag is written at release time (update-deployment-values); the default only keeps `helm template` working.
+#
+# Two ports: 9090 gRPC (admin API and introspection, cluster internal) and 8080 HTTP (OAuth/OIDC,
+# the only one an ingress exposes).
+application:
+  deployment:
+    volumes:
+      - name: signing-key
+        secret:
+          secretName: identity-signing-key
+          defaultMode: 0400
+      # retired keys after a rotation: one entry per key, named <kid>.pem; optional, may not exist
+      - name: previous-keys
+        secret:
+          secretName: identity-previous-keys
+          optional: true
+          defaultMode: 0400
+      - name: courier-token
+        projected:
+          sources:
+            - serviceAccountToken:
+                audience: courier
+                expirationSeconds: 3600
+                path: token
+    container:
+      image:
+        repository: huponx/identity
+        tag: "0.0.0"
+      port: 9090
+      extraPorts:
+        - name: http
+          containerPort: 8080
+      envFrom:
+        - configMapRef:
+            name: '{{ include "common.name" . }}-env-vars'
+      startupProbe:
+        httpGet:
+          path: /healthz
+          port: 8080
+        failureThreshold: 30
+        periodSeconds: 2
+      livenessProbe:
+        httpGet:
+          path: /healthz
+          port: 8080
+        periodSeconds: 20
+      readinessProbe:
+        httpGet:
+          path: /readyz
+          port: 8080
+        periodSeconds: 10
+      resources:
+        limits:
+          cpu: 500m
+          memory: 256Mi
+        requests:
+          cpu: 100m
+          memory: 128Mi
+      securityContext:
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: [ALL]
+      # The signing key (PEM) comes from an existing Secret that is never in git; the projected
+      # token is how identity proves itself to courier (audience courier).
+      volumeMounts:
+        - name: signing-key
+          mountPath: /var/run/identity/keys
+          readOnly: true
+        - name: previous-keys
+          mountPath: /var/run/identity/previous-keys
+          readOnly: true
+        - name: courier-token
+          mountPath: /var/run/secrets/courier
+          readOnly: true
+  # Callers of the gRPC API present identity JWTs (client_credentials / token exchange, audience
+  # identity), verified locally with the signing key: no TokenReview, no auth-delegator.
+  serviceAccount:
+    create: true
+  service:
+    enabled: true
+    port: 9090
+    extraPorts:
+      - name: http
+        port: 8080
+        targetPort: 8080
+        protocol: TCP
+  config:
+    data:
+      HOST: "0.0.0.0"
+      PORT: "9090"
+      HTTP_PORT: "8080"
+      LOG_ENCODING: json
+      IDENTITY_SIGNING_KEY_FILE: /var/run/identity/keys/signing.pem
+      IDENTITY_PREVIOUS_KEYS_DIR: /var/run/identity/previous-keys
+      COURIER_TOKEN_FILE: /var/run/secrets/courier/token
+  # Secret values stay out of git: reference existing Secrets (mm-deploy overrides this list).
+  secrets: []
+  # The ingress exposes the HTTP port only; mm-deploy sets host and TLS.
+  ingress:
+    enabled: false
+    paths:
+      - path: /
+        pathType: Prefix
+        servicePort: 8080
+  autoscaling:
+    enabled: false
+  pdb:
+    enabled: false

@@ -1,0 +1,34 @@
+apps:
+  - name: identity
+    language: go
+    cicd:
+      jobs:
+        containerize-and-package:
+          image-name: identity
+          dockerfile-path: build/identity/Dockerfile
+          chart-path: charts/identity
+          image-tag-paths:
+            - .application.deployment.container.image.tag
+          trivy:
+            severity: "LOW,MEDIUM,HIGH,CRITICAL"
+            ignore-unfixed: true
+            exit-code: 0   # report only: the CVEs are listed in the PR comment, the build does not fail
+global:
+  deploy:
+    repo: huponx/mm-deploy
+    base-branch: main
+    file: "applications/{env}/{app}.yaml"
+    set:
+      - .spec.source.targetRevision
+  environments:
+    dev:
+      workflows: [main]
+      automerge: true
+      labels: [automerge]
+    staging:
+      workflows: [staging]
+      enabled: true
+      labels: [automerge]
+    production:
+      workflows: [production]
+      enabled: true
