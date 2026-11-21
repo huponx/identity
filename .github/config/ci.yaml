@@ -27,9 +27,9 @@ global:
       labels: [automerge]
     staging:
       workflows: [staging]
-      enabled: true
+      enabled: false
       labels: [automerge]
     production:
       workflows: [production]
-      enabled: true
+      enabled: false
       labels: [automerge]
