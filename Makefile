@@ -1,0 +1,42 @@
+GO  ?= go
+BIN ?= bin
+IMAGE_TAG  ?= dev
+IMAGE_REPO ?= ghcr.io/huponx
+
+.PHONY: help tidy test vet build run e2e docker clean
+
+help:
+	@printf '%s\n' \
+		'tidy    go mod tidy' \
+		'test    go test -race ./...' \
+		'vet     go vet ./...' \
+		'build   identity and identityctl into $(BIN)/' \
+		'run     go run ./cmd/identity (reads the environment, see .env.example)' \
+		'e2e     scripts/e2e.sh: code+PKCE, refresh reuse, token exchange against local Postgres/Redis' \
+		'docker  build the image'
+
+tidy:
+	GOWORK=off $(GO) mod tidy
+
+test:
+	$(GO) test -race ./...
+
+vet:
+	$(GO) vet ./...
+
+build:
+	@mkdir -p $(BIN)
+	$(GO) build -o $(BIN)/identity ./cmd/identity
+	$(GO) build -o $(BIN)/identityctl ./cmd/identityctl
+
+run:
+	$(GO) run ./cmd/identity
+
+e2e:
+	scripts/e2e.sh
+
+docker:
+	docker build -f build/identity/Dockerfile -t $(IMAGE_REPO)/identity:$(IMAGE_TAG) .
+
+clean:
+	rm -rf $(BIN)
