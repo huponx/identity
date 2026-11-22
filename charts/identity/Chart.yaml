@@ -10,3 +10,10 @@ dependencies:
     version: 1.3.0
     repository: oci://ghcr.io/huponx/charts
     alias: application
+  # The initial setup Job (first admin, clients, exchange policies). Off by default: mm-deploy turns it
+  # on (setup.enabled) for the first rollout and removes it afterwards.
+  - name: go-job
+    version: 1.1.0
+    repository: oci://ghcr.io/huponx/charts
+    alias: setup
+    condition: setup.enabled

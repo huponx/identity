@@ -282,7 +282,13 @@ type Challenge struct {
 	SessionID string // public id of the session being stepped up, "" for a login
 	AMR       []string
 	Attempts  int64
+	// Purpose tells what the challenge is for: "" is a second factor, PurposePassword a forced
+	// password change after a correct password. One kind is never accepted for the other.
+	Purpose string
 }
+
+// PurposePassword is the Purpose of a pending forced password change.
+const PurposePassword = "password"
 
 const challengeTTL = 5 * time.Minute
 
@@ -291,7 +297,7 @@ func (s *State) SaveChallenge(ctx context.Context, id string, c Challenge) error
 	key := "identity:mfa:" + hash(id)
 	amr, _ := json.Marshal(c.AMR)
 	pipe := s.rdb.TxPipeline()
-	pipe.HSet(ctx, key, map[string]any{"uid": c.UserID, "ret": c.ReturnTo, "sid": c.SessionID, "amr": string(amr), "n": 0})
+	pipe.HSet(ctx, key, map[string]any{"uid": c.UserID, "ret": c.ReturnTo, "sid": c.SessionID, "amr": string(amr), "pur": c.Purpose, "n": 0})
 	pipe.Expire(ctx, key, challengeTTL)
 	_, err := pipe.Exec(ctx)
 	return err
@@ -313,7 +319,7 @@ func (s *State) Attempt(ctx context.Context, id string, max int64) (*Challenge, 
 		_ = s.rdb.Del(ctx, key).Err()
 		return nil, ErrNotFound
 	}
-	c := &Challenge{UserID: m["uid"], ReturnTo: m["ret"], SessionID: m["sid"], Attempts: n}
+	c := &Challenge{UserID: m["uid"], ReturnTo: m["ret"], SessionID: m["sid"], Attempts: n, Purpose: m["pur"]}
 	_ = json.Unmarshal([]byte(m["amr"]), &c.AMR)
 	return c, nil
 }
@@ -328,7 +334,7 @@ func (s *State) PeekChallenge(ctx context.Context, id string) (*Challenge, error
 		return nil, ErrNotFound
 	}
 	n, _ := strconv.ParseInt(m["n"], 10, 64)
-	c := &Challenge{UserID: m["uid"], ReturnTo: m["ret"], SessionID: m["sid"], Attempts: n}
+	c := &Challenge{UserID: m["uid"], ReturnTo: m["ret"], SessionID: m["sid"], Attempts: n, Purpose: m["pur"]}
 	_ = json.Unmarshal([]byte(m["amr"]), &c.AMR)
 	return c, nil
 }

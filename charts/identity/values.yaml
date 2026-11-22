@@ -116,3 +116,35 @@ application:
     enabled: false
   pdb:
     enabled: false
+
+# Initial setup Job (alias `setup` of the go-job chart): runs /identity-setup once after the sync, see
+# the README ("Initial setup Job"). Disabled by default; mm-deploy sets `setup.enabled: true` plus
+# the env below (SETUP_CONFIG, POSTGRES_*) and the `secrets`, then removes it after the first success.
+# image.tag is written at release time like the application's.
+setup:
+  enabled: false
+  job:
+    annotations:
+      argocd.argoproj.io/hook: PostSync
+      argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    backoffLimit: 3
+    ttlSecondsAfterFinished: 3600
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
+      runAsGroup: 65532
+    container:
+      image:
+        repository: huponx/identity
+        tag: "0.0.0"
+      command: ["/identity-setup"]
+      resources:
+        limits:
+          cpu: 200m
+          memory: 128Mi
+        requests:
+          cpu: 50m
+          memory: 64Mi
+  # Existing Secrets (mm-ansible): mm-deploy lists POSTGRES_PASSWORD, SETUP_ADMIN_PASSWORD and one variable
+  # per confidential client (named by secret_env in SETUP_CONFIG).
+  secrets: []
