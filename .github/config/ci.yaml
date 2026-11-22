@@ -9,6 +9,7 @@ apps:
           chart-path: charts/identity
           image-tag-paths:
             - .application.deployment.container.image.tag
+            - .setup.job.container.image.tag
           trivy:
             severity: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
             ignore-unfixed: true

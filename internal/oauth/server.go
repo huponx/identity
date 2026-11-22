@@ -79,6 +79,8 @@ func (s *Server) Routes(r *gin.Engine) error {
 	r.POST("/login", s.loginSubmit)
 	r.GET("/login/mfa", s.mfaForm)
 	r.POST("/login/mfa", s.mfaSubmit)
+	r.GET("/login/password", s.passwordChangeForm)
+	r.POST("/login/password", s.passwordChangeSubmit)
 
 	r.GET("/password/forgot", s.forgotForm)
 	r.POST("/password/forgot", s.forgotSubmit)
@@ -208,6 +210,12 @@ button{margin-top:1rem;padding:.6rem 1rem;border:0;border-radius:4px;background:
 <label for="code">Code from your authenticator app, or a recovery code</label>
 <input id="code" type="text" name="code" inputmode="text" autocomplete="one-time-code" required autofocus>
 <button type="submit">Verify</button></form>{{template "foot"}}{{end}}
+
+{{define "password-change"}}{{template "head" .}}<form method="post" action="/login/password">
+<input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="c" value="{{.Fields.c}}">
+<label for="pw">New password (at least 12 characters)</label><input id="pw" type="password" name="password" autocomplete="new-password" minlength="12" required autofocus>
+<label for="pw2">Repeat the new password</label><input id="pw2" type="password" name="password2" autocomplete="new-password" minlength="12" required>
+<button type="submit">Set the password</button></form>{{template "foot"}}{{end}}
 
 {{define "forgot"}}{{template "head" .}}{{if not .Notice}}<form method="post" action="/password/forgot">
 <input type="hidden" name="csrf" value="{{.CSRF}}"><label for="email">E-mail</label>

@@ -78,14 +78,16 @@ type User struct {
 	Disabled          bool
 	MFAEnabled        bool
 	MFAEnforced       bool
-	CreatedAt         time.Time
+	// MustChangePassword: the password was set by somebody else (setup Job); the user must choose their own at the next sign in.
+	MustChangePassword bool
+	CreatedAt          time.Time
 }
 
-const userCols = `id::text, email, name, locale, coalesce(password_hash, ''), password_changed_at, disabled, mfa_enabled, mfa_enforced, created_at`
+const userCols = `id::text, email, name, locale, coalesce(password_hash, ''), password_changed_at, disabled, mfa_enabled, mfa_enforced, must_change_password, created_at`
 
 func scanUser(row pgx.Row) (*User, error) {
 	var u User
-	err := row.Scan(&u.ID, &u.Email, &u.Name, &u.Locale, &u.PasswordHash, &u.PasswordChangedAt, &u.Disabled, &u.MFAEnabled, &u.MFAEnforced, &u.CreatedAt)
+	err := row.Scan(&u.ID, &u.Email, &u.Name, &u.Locale, &u.PasswordHash, &u.PasswordChangedAt, &u.Disabled, &u.MFAEnabled, &u.MFAEnforced, &u.MustChangePassword, &u.CreatedAt)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -111,8 +113,8 @@ func (s *Store) CreateUser(ctx context.Context, u User, roles []string) (*User, 
 	if u.PasswordHash != "" {
 		pw, changed = u.PasswordHash, time.Now()
 	}
-	row := tx.QueryRow(ctx, `INSERT INTO identity_users (email, name, locale, password_hash, password_changed_at)
-		VALUES ($1, $2, $3, $4, $5) RETURNING `+userCols, NormalizeEmail(u.Email), u.Name, u.Locale, pw, changed)
+	row := tx.QueryRow(ctx, `INSERT INTO identity_users (email, name, locale, password_hash, password_changed_at, must_change_password)
+		VALUES ($1, $2, $3, $4, $5, $6) RETURNING `+userCols, NormalizeEmail(u.Email), u.Name, u.Locale, pw, changed, u.MustChangePassword)
 	created, err := scanUser(row)
 	if err != nil {
 		return nil, err
@@ -159,7 +161,7 @@ func (s *Store) SetUserDisabled(ctx context.Context, id string, disabled bool) e
 
 // SetUserPassword stores a new password hash.
 func (s *Store) SetUserPassword(ctx context.Context, id, hash string) error {
-	return s.execUser(ctx, id, `UPDATE identity_users SET password_hash = $2, password_changed_at = now(), updated_at = now() WHERE id = $1`, hash)
+	return s.execUser(ctx, id, `UPDATE identity_users SET password_hash = $2, password_changed_at = now(), must_change_password = false, updated_at = now() WHERE id = $1`, hash)
 }
 
 // SetUserMFAFlags updates mfa_enabled and mfa_enforced (nil leaves a flag alone).
@@ -194,6 +196,40 @@ func (s *Store) strings(ctx context.Context, sql string, args ...any) ([]string,
 		out = append(out, v)
 	}
 	return out, rows.Err()
+}
+
+// CreateFirstAdmin creates the user with the admin role only when no admin exists. The check and the
+// insert run in one transaction under an advisory lock, so two concurrent runs create at most one admin.
+// It returns nil, false when an admin already exists.
+func (s *Store) CreateFirstAdmin(ctx context.Context, u User) (*User, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('identity-first-admin'))`); err != nil {
+		return nil, false, err
+	}
+	var n int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM identity_user_roles WHERE role = 'admin'`).Scan(&n); err != nil {
+		return nil, false, err
+	}
+	if n > 0 {
+		return nil, false, nil
+	}
+	if u.Locale == "" {
+		u.Locale = "en"
+	}
+	row := tx.QueryRow(ctx, `INSERT INTO identity_users (email, name, locale, password_hash, password_changed_at, must_change_password)
+		VALUES ($1, $2, $3, $4, now(), $5) RETURNING `+userCols, NormalizeEmail(u.Email), u.Name, u.Locale, u.PasswordHash, u.MustChangePassword)
+	created, err := scanUser(row)
+	if err != nil {
+		return nil, false, err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO identity_user_roles (user_id, role) VALUES ($1, 'admin')`, created.ID); err != nil {
+		return nil, false, mapErr(err)
+	}
+	return created, true, tx.Commit(ctx)
 }
 
 // CountAdmins is the number of users holding the admin role (bootstrap runs only at zero).
@@ -302,6 +338,21 @@ func (s *Store) ListClients(ctx context.Context) ([]Client, error) {
 // SetClientSecret replaces the secret hash of a confidential client.
 func (s *Store) SetClientSecret(ctx context.Context, id, hash string) error {
 	tag, err := s.pool.Exec(ctx, `UPDATE identity_clients SET secret_hash = $2, updated_at = now() WHERE client_id = $1 AND type = 'confidential'`, id, hash)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetClientConfig replaces the URIs, grants and scopes of an existing client (the setup Job passes the
+// union of the stored and the wanted values).
+func (s *Store) SetClientConfig(ctx context.Context, id string, redirects, logouts, grants, scopes []string) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE identity_clients SET redirect_uris = $2, post_logout_redirect_uris = $3,
+		allowed_grants = $4, allowed_scopes = $5, updated_at = now() WHERE client_id = $1`,
+		id, nz(redirects), nz(logouts), nz(grants), nz(scopes))
 	if err != nil {
 		return mapErr(err)
 	}
