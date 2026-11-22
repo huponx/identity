@@ -10,7 +10,7 @@ help:
 		'tidy    go mod tidy' \
 		'test    go test -race ./...' \
 		'vet     go vet ./...' \
-		'build   identity and identityctl into $(BIN)/' \
+		'build   identity and identity-setup into $(BIN)/' \
 		'run     go run ./cmd/identity (reads the environment, see .env.example)' \
 		'e2e     scripts/e2e.sh: code+PKCE, refresh reuse, token exchange against local Postgres/Redis' \
 		'docker  build the image'
@@ -27,7 +27,7 @@ vet:
 build:
 	@mkdir -p $(BIN)
 	$(GO) build -o $(BIN)/identity ./cmd/identity
-	$(GO) build -o $(BIN)/identityctl ./cmd/identityctl
+	$(GO) build -o $(BIN)/identity-setup ./cmd/identity-setup
 
 run:
 	$(GO) run ./cmd/identity

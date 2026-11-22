@@ -177,7 +177,7 @@ func (s *Server) authorize(c *gin.Context) {
 
 	// 3. who is signing in
 	sess, user, _ := s.sessionFrom(c)
-	needLogin := sess == nil || prompt == "login" || (maxAge > 0 && s.now().Sub(sess.AuthTime) > maxAge)
+	needLogin := sess == nil || (user != nil && user.MustChangePassword) || prompt == "login" || (maxAge > 0 && s.now().Sub(sess.AuthTime) > maxAge)
 	if needLogin {
 		if prompt == "none" {
 			fail("login_required", "")
@@ -284,6 +284,22 @@ func (s *Server) loginSubmit(c *gin.Context) {
 		}
 	}
 
+	if user.MustChangePassword {
+		// the password was set by somebody else: no session until the user chose their own
+		id := password.Random(24)
+		if err := s.state.SaveChallenge(ctx, id, state.Challenge{UserID: user.ID, ReturnTo: ret, Purpose: state.PurposePassword}); err != nil {
+			s.fail(c, err)
+			return
+		}
+		c.Redirect(http.StatusSeeOther, "/login/password?c="+url.QueryEscape(id))
+		return
+	}
+	s.continueLogin(c, user, ret)
+}
+
+// continueLogin runs the steps after the password: the second factor, then the session.
+func (s *Server) continueLogin(c *gin.Context, user *store.User, ret string) {
+	ctx := c.Request.Context()
 	switch s.acct.MFARequirement(user) {
 	case account.Verify:
 		id := password.Random(24)
@@ -323,7 +339,7 @@ func (s *Server) startSession(c *gin.Context, userID string, amr []string) error
 
 func (s *Server) mfaForm(c *gin.Context) {
 	id := c.Query("c")
-	if _, err := s.state.PeekChallenge(c.Request.Context(), id); err != nil {
+	if ch, err := s.state.PeekChallenge(c.Request.Context(), id); err != nil || ch.Purpose != "" {
 		c.Redirect(http.StatusSeeOther, "/login")
 		return
 	}
@@ -341,6 +357,9 @@ func (s *Server) mfaSubmit(c *gin.Context) {
 		return
 	}
 	ch, err := s.state.Attempt(ctx, id, 5)
+	if err == nil && ch.Purpose != "" { // a password change challenge is not a second factor
+		err = state.ErrNotFound
+	}
 	if errors.Is(err, state.ErrNotFound) {
 		s.render(c, http.StatusUnauthorized, "login", page{Title: "Sign in", Message: "Too many wrong codes or the request expired. Please sign in again.",
 			CSRF: s.csrfToken(c), ReturnTo: "/account/mfa", Fields: map[string]string{}})

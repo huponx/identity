@@ -12,7 +12,7 @@ COPY . .
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags "-s -w" -o /out/identity ./cmd/identity && GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags "-s -w" -o /out/identityctl ./cmd/identityctl
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags "-s -w" -o /out/identity ./cmd/identity && GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags "-s -w" -o /out/identity-setup ./cmd/identity-setup
 
 # static + CA certificates, runs as non-root
 FROM gcr.io/distroless/static-debian13:nonroot
@@ -23,7 +23,7 @@ LABEL org.opencontainers.image.title="identity" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}"
 COPY --from=build /out/identity /identity
-COPY --from=build /out/identityctl /identityctl
+COPY --from=build /out/identity-setup /identity-setup
 EXPOSE 9090 8080
 USER nonroot:nonroot
 ENTRYPOINT ["/identity"]

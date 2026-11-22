@@ -68,9 +68,11 @@ type Identity struct {
 	// (the ingress controller). Empty: the connection address is used, which is safe but makes the
 	// per-IP rate limits count the ingress as one client.
 	TrustedProxies []string `env:"IDENTITY_TRUSTED_PROXIES" envSeparator:","`
+}
 
-	// BootstrapPassword is only read by identityctl (first admin).
-	BootstrapPassword string `env:"IDENTITY_BOOTSTRAP_PASSWORD"`
+// Setup is the configuration of identity-setup (the initial setup Job): only the database.
+type Setup struct {
+	config.Postgres
 }
 
 func (c Identity) GRPCAddr() string { return fmt.Sprintf("%s:%d", c.Host, c.GRPCPort) }

@@ -2,7 +2,7 @@
 
 Authentication and authorization service of the platform: an **OAuth 2.0 / OpenID Connect provider** that issues **JWTs** (with `jti`), keeps **RBAC** roles and permissions, supports **token exchange** (RFC 8693) with a per-service audience, an SSO session, **MFA (TOTP)** that each user can turn on or off (or an admin can enforce) and **password reset** by e-mail through `courier`.
 
-Module: `github.com/huponx/identity`. Contracts live in `protos` (`identity/v1`), schema in `db-migration` (`identity_*`, `V1..V7`), shared code (`jwtx`, `authz`, `authn`, `grpcserver`, `tokenexchange`, `oidcclient`) in `gocommon`.
+Module: `github.com/huponx/identity`. Contracts live in `protos` (`identity/v1`), schema in `db-migration` (`identity_*`, `V1..V8`), shared code (`jwtx`, `authz`, `authn`, `grpcserver`, `tokenexchange`, `oidcclient`) in `gocommon`.
 
 ```
 browser --OIDC--> gatekeeper (BFF) --OIDC code+PKCE--> identity (HTTP :8080)
@@ -57,7 +57,7 @@ Permissions are colon separated segments with segment wildcards: `*` alone match
 | `COURIER_TARGET`, `COURIER_TOKEN_FILE` | empty | e-mails; empty disables them (links are logged when `ENV=local`) |
 | `POSTGRES_*`, `REDIS_*`, `HOST`, `ENV`, `LOG_*` | | gocommon blocks |
 
-MFA per user: with `optional` a user turns it on/off in `/account/mfa` (disabling asks for the password and a code); an admin can enforce, un-enforce, disable or reset it per user (`identityctl user mfa`, or `SetUserMFA`/`EnforceUserMFA`/`ResetUserMFA` over gRPC). Recovery codes are shown once.
+MFA per user: with `optional` a user turns it on/off in `/account/mfa` (disabling asks for the password and a code); an admin can enforce, un-enforce, disable or reset it per user (in the admin app, or `SetUserMFA`/`EnforceUserMFA`/`ResetUserMFA` over gRPC). Recovery codes are shown once.
 
 ## CI/CD
 
@@ -199,7 +199,7 @@ Do this once per repository, before the first release. Commands use the [GitHub 
 
 Runtime setup of the service in the cluster (after the repository setup above):
 
-1. **Schema**: apply `db-migration` (`V1..V7`) to the `identity` database.
+1. **Schema**: apply `db-migration` (`V1..V8`) to the `identity` database.
 2. **Secrets** (signing key, MFA key, passwords) are created by `mm-ansible` from its vault, never by hand and never in git (the `mm-deploy` policy forbids secrets there). Generate the values once and store them in the vault, see the mm-ansible README, "Identity and gatekeeper secrets":
    ```bash
    cd ../mm-ansible
@@ -212,48 +212,60 @@ Runtime setup of the service in the cluster (after the repository setup above):
    **Rotation:** (a) in the vault keep the old PEM as the Secret `identity-previous-keys` with the key `<old kid>.pem` (add that Secret to mm-ansible `k8s_secrets.yml`; the chart mounts it, optional, at `/var/run/identity/previous-keys`, `IDENTITY_PREVIOUS_KEYS_DIR`), (b) replace `signing.pem` with a new key (`make identity-secrets` prints one) and set a new `IDENTITY_SIGNING_KEY_ID` in `mm-deploy`, (c) `make deploy TAGS=secrets`; the pods restart. New tokens are signed with the new key; old tokens keep verifying because the old public key stays in the JWKS (services refresh their JWKS cache on an unknown `kid`). Delete the previous key after the longest token lifetime (refresh tokens are opaque, so the access/ID token TTL, 10 minutes by default, is enough). MFA key (`identity-mfa-key`, key `keys`): to rotate, prepend a new `k2:<key>,k1:<key>` (the first seals, the others only open).
 3. Other Secrets referenced by `application.secrets`: Postgres password (`postgres-data-rw-credentials`) and Redis password (`redis-local-credentials`), also from the mm-ansible vault.
 4. **Deploy** with `mm-deploy` (`applications/<env>/identity.yaml`): set `IDENTITY_ISSUER`, `IDENTITY_SIGNING_KEY_ID`, `POSTGRES_HOST`, `REDIS_HOST`, the ingress host/TLS, and allow identity's ServiceAccount in courier (`COURIER_AUTH_ALLOWED`).
-5. **First admin** (only works while no admin exists), see [Running identityctl](#running-identityctl-in-kubernetes):
-   ```bash
-   kubectl -n application exec -it deploy/identity -- \
-     env IDENTITY_BOOTSTRAP_PASSWORD='<strong password>' /identityctl bootstrap --email admin@example.com
-   ```
-6. **Clients and policies** (`identityctl client create ...`, `identityctl exchange set ...`; see `identityctl` without arguments). For a web app behind gatekeeper see the gatekeeper README.
-   The client secret that `client create` prints once goes into the mm-ansible vault (`application-gatekeeper-client.secret`, then `make deploy TAGS=secrets`), not into a log or a shell history.
+5. **Initial setup Job** (first admin, the client of the gateway, its exchange policy), see [Initial setup Job](#initial-setup-job). It runs once as an ArgoCD hook from the same `mm-deploy` Application, then you remove it.
+6. Everything else (more users, roles and permissions, later clients, MFA, password resets) is done in the admin web app or over the gRPC API. There is no CLI.
 
-### Running identityctl in Kubernetes
+### Initial setup Job
 
-The image ships `/identityctl` next to `/identity`. `identityctl` talks straight to Postgres and Redis and reads the same environment as the server (`POSTGRES_*`, `REDIS_*`, `IDENTITY_*`), which the identity pod already has, so the simplest way is to run it inside that pod:
+`/identity-setup` (in the identity image, `cmd/identity-setup`) is run once as a Kubernetes Job (the `setup` alias of the `go-job` chart, an ArgoCD `PostSync` hook). It needs only Postgres (the schema from `db-migration` must exist) and does only what the UI and the gRPC API cannot do from nothing:
 
-```bash
-# first admin (the password is read from the environment of this command only)
-kubectl -n application exec -it deploy/identity -- \
-  env IDENTITY_BOOTSTRAP_PASSWORD='<strong password>' /identityctl bootstrap --email admin@company.com
+| Step | Behaviour |
+|---|---|
+| First admin | Created **only when no admin exists** (checked and inserted in one transaction under an advisory lock). Any later run, with the same or another e-mail, skips it. The password comes from the Secret `identity-admin` (`SETUP_ADMIN_PASSWORD`, set by mm-ansible, see "Identity and gatekeeper secrets") and must pass the password policy. The user is created with `must_change_password`: at the first sign in identity asks for a new password (`/login/password`) before any session, MFA step or authorization code. |
+| Clients | Declared in `SETUP_CONFIG`. Created when missing; when present the redirect and post logout URIs, grants and scopes are **added** (never removed) and missing roles assigned. A confidential client takes its secret from an environment variable named by `secret_env` (the Secret `gatekeeper-client`); the hash is stored on create and whenever the Secret changes. Nothing is printed. Type and `resource` of an existing client cannot change (the Job fails); `backchannel_logout_uri` is only used on create. |
+| Exchange policies | Upserted from `SETUP_CONFIG`. |
 
-# the client of the gateway, its exchange policy, and the origin of another web app
-kubectl -n application exec -it deploy/identity -- /identityctl client create --id gatekeeper --type confidential --resource gatekeeper \
-  --redirect-uri https://api.company.com/auth/callback --post-logout-uri https://admin.company.com/ \
-  --grant authorization_code --grant refresh_token --grant client_credentials \
-  --grant urn:ietf:params:oauth:grant-type:token-exchange
-kubectl -n application exec -it deploy/identity -- /identityctl exchange set --client gatekeeper --audience identity --depth 1
-kubectl -n application exec -it deploy/identity -- /identityctl client add-uri --id gatekeeper --post-logout-uri https://dict.company.com/
+Everything except the admin is idempotent, so a re-sync before you remove the Job is harmless.
+
+`SETUP_CONFIG` (JSON, unknown fields are rejected; an example lives in each `mm-deploy` `applications/<env>/identity.yaml`):
+
+```json
+{
+  "admin": {"email": "admin@company.com", "name": "Administrator"},
+  "clients": [{
+    "id": "gatekeeper", "type": "confidential", "resource": "gatekeeper", "secret_env": "GATEKEEPER_CLIENT_SECRET",
+    "redirect_uris": ["https://api.company.com/auth/callback"],
+    "post_logout_uris": ["https://admin.company.com/", "https://dict.company.com/"],
+    "grants": ["authorization_code", "refresh_token", "client_credentials", "urn:ietf:params:oauth:grant-type:token-exchange"]
+  }],
+  "exchange_policies": [{"client": "gatekeeper", "audience": "identity", "max_depth": 1}]
+}
 ```
 
-- The image is distroless: there is no shell, call `/identityctl` directly (it is not in `PATH`).
-- `client create` prints the client secret once. Put it straight into the vault of `mm-ansible` (Secret `gatekeeper-client`, key `secret`), not into a log or a shell history.
-- The bootstrap password must satisfy the password policy (at least 12 characters, not the e-mail). Never commit it or put it in a ConfigMap; use a real value, not the sample of the local guide.
-- Alternatives: port-forward Postgres and Redis and run a local `identityctl` with `POSTGRES_*`/`REDIS_*` pointing at them (it also needs the same `IDENTITY_MFA_KEY`), or a one-off Job on the identity image with `command: ["/identityctl", ...]` and the password from a Secret.
-- The schema (`db-migration`) must be applied first. After the first admin exists, day to day administration goes through the admin web app or the gRPC API; keep `identityctl` for the bootstrap and emergencies.
+Client fields: `id`, `type` (`public`|`confidential`), `resource` (audience), `secret_env` (confidential only), `name`, `redirect_uris`, `post_logout_uris`, `backchannel_logout_uri`, `grants` (default `authorization_code`, `refresh_token`), `scopes` (default `openid profile email offline_access`), `roles`. `admin.keep_password: true` skips the forced change and is only for local runs and the end to end scripts.
+
+**Rollout**
+
+1. Put `identity-admin` (temporary password) and `gatekeeper-client` in the mm-ansible vault and `make deploy TAGS=secrets` (`make identity-secrets` generates both).
+2. Release `db-migration` (`V8` adds `must_change_password`), then the identity chart (it carries the Job and the image has `/identity-setup`).
+3. In `mm-deploy` `applications/<env>/identity.yaml` the `setup:` block (`enabled: true`, `POSTGRES_*`, `SETUP_CONFIG`, the three Secret references) is already present; bump `targetRevision` to the new release. ArgoCD runs the Job after the sync (`kubectl -n application logs job/<release>-job-<tag>`; the log lines never contain a secret).
+4. Sign in at the identity host with the admin e-mail and the temporary password, choose your own password.
+5. **Remove the `setup:` block from the `mm-deploy` Application** (the Job is not needed again), then remove `identity-admin` from the vault and from `k8s_secrets.yml` (`state: absent` first, see the mm-ansible README).
+
+**Later changes of the clients.** The admin app cannot add URIs to an existing client (identity has no update call). To add a web app origin as a post logout URI, put the `setup:` block back with the new URI (and the Secrets it references, `identity-admin` can be left out of `SETUP_CONFIG`: without `admin` the step is skipped) and sync; remove it again afterwards. To rotate the `gatekeeper` secret use the admin app (Clients, rotate) and put the new value in the vault, and do not leave the Job deployed meanwhile: it would reset the secret to the value of the Secret.
+
+If the first admin is locked out, use the password reset mail. If every admin is gone, delete the user rows by hand and re-add the `setup:` block: the Job creates the admin again because no admin exists.
 
 ## Local development
 
 ```bash
-(cd ../db-migration && make up)            # Postgres + Redis + schema V1..V7 (db=app, user=postgres)
+(cd ../db-migration && make up)            # Postgres + Redis + schema V1..V8 (db=app, user=postgres)
 cp .env.example .env                       # ENV=local, local key, MFA key
 make test                                  # unit tests
 POSTGRES_PASSWORD=postgres make e2e             # code+PKCE, refresh reuse, client_credentials, token exchange, revoke
 ```
 
-`scripts/e2e.sh` builds both binaries and runs `scripts/e2e.py` against a local Postgres/Redis (it creates its own clients; it creates an admin only when none exists).
+`scripts/e2e.sh` builds `identity` and `identity-setup`, runs the setup (its own clients with random ids; an admin only when none exists, with `keep_password`) and runs `scripts/e2e.py` against a local Postgres/Redis.
 
 `go.work` (git-ignored) points at `../gocommon` and the generated `protogen/go`; after both are released run `go get github.com/huponx/gocommon@latest github.com/huponx/protogen/go@latest && go mod tidy`.
 

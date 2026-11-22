@@ -108,10 +108,10 @@ sequenceDiagram
 Setup (once per service):
 
 ```bash
-identityctl client create --id billing-job --type confidential --resource billing-job \
-  --grant client_credentials
-identityctl client role --id billing-job --role billing-writer       # permissions come from roles
-identityctl exchange set --client billing-job --audience courier --max-scope "..."  # may ask tokens for courier
+# in the admin app (or the gRPC API: CreateClient, AssignRole, SetExchangePolicy):
+#   client billing-job: confidential, resource billing-job, grant client_credentials
+#   role billing-writer given to the client                         # permissions come from roles
+#   exchange policy billing-job -> courier, max scope "..."         # may ask tokens for courier
 ```
 
 Put the printed secret in the vault of `mm-ansible` and mount it as the client secret of the service.
@@ -155,9 +155,9 @@ sequenceDiagram
 Setup:
 
 ```bash
-identityctl client create --id gatekeeper --type confidential --resource gatekeeper ... \
-  --grant urn:ietf:params:oauth:grant-type:token-exchange
-identityctl exchange set --client gatekeeper --audience identity --depth 1
+# by the identity setup Job (SETUP_CONFIG in mm-deploy), see the identity README:
+#   client gatekeeper: confidential, resource gatekeeper, grants incl. urn:ietf:params:oauth:grant-type:token-exchange
+#   exchange policy gatekeeper -> identity, max_depth 1
 ```
 
 Rules enforced by identity (`token.Service.Exchange`):
@@ -187,7 +187,7 @@ exchanges that token for the upstream. `token.Service.Exchange` detects `subject
 
 - The new token keeps the **service** as `sub` and carries the permissions of the service roles on the upstream audience.
 - `act` is the gateway.
-- Setup: the service has a client with `client_credentials`, a role, and `identityctl exchange set --client <service> --audience gatekeeper`. The gateway needs its own policy (gatekeeper, upstream) as usual.
+- Setup: the service has a client with `client_credentials`, a role, and an exchange policy `<service> -> gatekeeper` (admin app or `SetExchangePolicy`). The gateway needs its own policy (gatekeeper, upstream) as usual.
 
 See the README of the gatekeeper, "Adding a service that calls the gateway".
 
@@ -254,5 +254,5 @@ gateway accepts JWT with audience equal to its own name.
 | Service token, exchange on the caller side | `gocommon/tokenexchange/tokenexchange.go`, `gocommon/grpcclient/jwt.go` (`WithServiceToken`, `WithTokenExchange`) |
 | `Principal`, `Can`, `IsService`, `ActorChain` | `gocommon/authn/authn.go` |
 | Client credentials and exchange in identity | `identity/internal/oauth/tokens.go`, `identity/internal/token/token.go` |
-| Policies, client roles | `identityctl exchange`, `identityctl client role`; gRPC `SetExchangePolicy`, `AssignRole` |
+| Policies, client roles | admin app, gRPC `SetExchangePolicy`, `AssignRole`; first ones from the setup Job (`identity/internal/setup`) |
 | Receiver wiring examples | `identity/cmd/identity/main.go`, `courier/internal/auth/auth.go` |

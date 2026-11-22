@@ -9,6 +9,7 @@ import (
 	"github.com/huponx/identity/internal/account"
 	"github.com/huponx/identity/internal/appconfig"
 	"github.com/huponx/identity/internal/password"
+	"github.com/huponx/identity/internal/state"
 	"github.com/huponx/identity/internal/store"
 )
 
@@ -136,6 +137,72 @@ func (s *Server) resetSubmit(c *gin.Context) {
 	default:
 		s.fail(c, err)
 	}
+}
+
+// ---- forced password change at login ----
+
+// passwordChangeForm asks for a new password after a correct login with a password somebody else set
+// (the setup Job). The challenge is created by loginSubmit; no session exists yet.
+func (s *Server) passwordChangeForm(c *gin.Context) {
+	id := c.Query("c")
+	if ch, err := s.state.PeekChallenge(c.Request.Context(), id); err != nil || ch.Purpose != state.PurposePassword {
+		c.Redirect(http.StatusSeeOther, "/login")
+		return
+	}
+	s.render(c, http.StatusOK, "password-change", page{Title: "Choose a new password", CSRF: s.csrfToken(c),
+		Message: "You are signing in with a temporary password. Choose your own to continue.", Notice: true, Fields: map[string]string{"c": id}})
+}
+
+func (s *Server) passwordChangeSubmit(c *gin.Context) {
+	ctx := c.Request.Context()
+	id := c.PostForm("c")
+	again := func(status int, msg string) {
+		s.render(c, status, "password-change", page{Title: "Choose a new password", Message: msg, CSRF: s.csrfToken(c), Fields: map[string]string{"c": id}})
+	}
+	if !s.csrfOK(c) {
+		again(http.StatusForbidden, "The form expired. Please try again.")
+		return
+	}
+	ch, err := s.state.Attempt(ctx, id, 10)
+	if err == nil && ch.Purpose != state.PurposePassword {
+		err = state.ErrNotFound
+	}
+	if errors.Is(err, state.ErrNotFound) {
+		s.render(c, http.StatusUnauthorized, "login", page{Title: "Sign in", Message: "Too many attempts or the request expired. Please sign in again.",
+			CSRF: s.csrfToken(c), ReturnTo: "/account/mfa", Fields: map[string]string{}})
+		return
+	}
+	if err != nil {
+		s.fail(c, err)
+		return
+	}
+	user, err := s.store.UserByID(ctx, ch.UserID)
+	if err != nil || user.Disabled || !user.MustChangePassword {
+		c.Redirect(http.StatusSeeOther, "/login")
+		return
+	}
+	pw := c.PostForm("password")
+	if pw != c.PostForm("password2") {
+		again(http.StatusUnprocessableEntity, "The two passwords are not the same.")
+		return
+	}
+	switch err := s.acct.SetPassword(ctx, user, pw, true); {
+	case err == nil:
+	case errors.Is(err, password.ErrTooShort), errors.Is(err, password.ErrTooLong), errors.Is(err, password.ErrCommon),
+		errors.Is(err, password.ErrSame), errors.Is(err, password.ErrEmail):
+		again(http.StatusUnprocessableEntity, err.Error()+".")
+		return
+	default:
+		s.fail(c, err)
+		return
+	}
+	_ = s.state.DeleteChallenge(ctx, id)
+	user, err = s.store.UserByID(ctx, user.ID) // the flag is cleared; the next steps use the stored user
+	if err != nil {
+		s.fail(c, err)
+		return
+	}
+	s.continueLogin(c, user, safeReturn(ch.ReturnTo))
 }
 
 // ---- account MFA page ----

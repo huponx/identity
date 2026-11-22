@@ -9,9 +9,10 @@ change too often to be useful).
 | Package | Role |
 | --- | --- |
 | `cmd/identity/main.go` | Wires everything: Postgres, Redis, keys, token service, account service, gRPC server and the HTTP server. Runs the hourly refresh token cleanup (`cleanup`). |
-| `cmd/identityctl/main.go` | Bootstrap and emergency CLI. Talks straight to Postgres and Redis (no gRPC). |
+| `cmd/identity-setup/main.go` | Initial setup, run once as a Kubernetes Job (first admin, clients, exchange policies). Talks straight to Postgres (no gRPC, no Redis). |
+| `internal/setup` | The setup logic: config parsing, admin only when none exists, client reconcile, exchange policies. |
 | `internal/oauth` | HTTP side: discovery, authorize, login, MFA pages, token, revoke, introspect, userinfo, logout, password reset, account MFA page. |
-| `internal/account` | Logic shared by the HTTP pages, the gRPC API and `identityctl`: password login, MFA, password reset, revocation, back-channel logout. |
+| `internal/account` | Logic shared by the HTTP pages, the gRPC API: password login, MFA, password reset, revocation, back-channel logout. |
 | `internal/token` | Signs access, ID and logout JWTs. Verifies our own tokens. Implements token exchange (RFC 8693). |
 | `internal/service` | gRPC `IdentityService` (administration) and the permission of each RPC. |
 | `internal/state` | Redis: SSO sessions, authorization codes, MFA challenges, token denylist, user cutoff, rate limits. |
@@ -41,6 +42,7 @@ Two listeners run in one process:
 | `GET, POST /oauth2/logout` | `endSession` (`pages.go`) |
 | `GET, POST /login` | `loginForm`, `loginSubmit` (`authorize.go`) |
 | `GET, POST /login/mfa` | `mfaForm`, `mfaSubmit` (`authorize.go`) |
+| `GET, POST /login/password` | `passwordChangeForm`, `passwordChangeSubmit` (`pages.go`): forced change of a temporary password |
 | `GET, POST /password/forgot` | `forgotForm`, `forgotSubmit` (`pages.go`) |
 | `GET, POST /password/reset` | `resetForm`, `resetSubmit` (`pages.go`) |
 | `GET, POST /account/mfa` | `accountMFA`, `accountMFAConfirm` (`pages.go`) |
@@ -86,30 +88,41 @@ passwords as argon2id (`password.Hash`), the TOTP secret sealed with AES-GCM (`m
 7. HTTP server: `/healthz`, `/readyz` (Postgres and Redis), then `oauth.Server.Routes`.
 8. On shutdown: HTTP shutdown, gRPC stop, `acct.Drain` (waits for mails and back-channel logout).
 
-## 3. One time setup (bootstrap)
+## 3. One time setup (the setup Job)
 
-Handled by `cmd/identityctl/main.go`. Nothing can call the gRPC API before an admin and a
-client exist, so this CLI writes to the database directly.
+Handled by `cmd/identity-setup/main.go` and `internal/setup/setup.go`, run once as an ArgoCD
+`PostSync` hook Job (the `setup` alias of the `go-job` chart, enabled from `mm-deploy` and removed
+after the first success). Nothing can call the gRPC API before an admin and a client exist, so the
+Job writes to the database directly. It needs only Postgres. Input: `SETUP_CONFIG` (JSON),
+`SETUP_ADMIN_PASSWORD` and one environment variable per confidential client (`secret_env`), all
+from Secrets set by mm-ansible. `setup.Parse` validates the config (unknown fields, URIs with
+`store.ValidURI`, a `secret_env` for every confidential client).
 
-| Command | Function | What it does |
+| Step | Function | What it does |
 | --- | --- | --- |
-| `bootstrap --email E` | `bootstrap` | Creates the first user with role `admin`. Password from `IDENTITY_BOOTSTRAP_PASSWORD`. Refuses when `store.CountAdmins` > 0. Applies `password.Check`. |
-| `client create` | `client` (`create`) | Creates a client. For `confidential` it generates `password.Random(32)` and stores `oauth.HashSecret(secret)`. The secret is printed once. |
-| `client add-uri` | `client` (`add-uri`) | `store.AddClientURIs` after `store.ValidURI`. |
-| `client rotate` | `client` (`rotate`) | New secret through `store.SetClientSecret`. |
-| `client role` | `client` (`role`) | `store.AssignRole` with a client id (roles of a service). |
-| `exchange set/delete` | `exchange` | `store.SetExchangePolicy`, `store.DeleteExchangePolicy`. |
-| `user mfa ...` | `user` | `account.AdminDisableMFA`, `AdminEnforceMFA`, `AdminResetMFA`. |
-| `user password-reset` | `user` | `account.SendReset`. |
+| First admin | `runAdmin` | `password.Check` (policy), `password.Hash`, then `store.CreateFirstAdmin`: in one transaction under `pg_advisory_xact_lock` it counts the admins and inserts the user with role `admin` and `must_change_password = true` only when there is none. Another run, or another e-mail, finds an admin and skips. `admin.keep_password` (local only) leaves the flag off. |
+| Client | `runClient` | Missing: `store.CreateClient` with the defaults (grants `authorization_code`, `refresh_token`; scopes `openid profile email offline_access`) and `oauth.HashSecret` of the secret from the environment. Present: type and `resource` must match; URIs, grants and scopes are merged (`store.SetClientConfig`), missing roles assigned (`store.AssignRole`), and the secret hash is replaced when it differs. |
+| Exchange policy | `Run` | `store.SetExchangePolicy` (upsert). |
+
+Everything except the admin is idempotent. Nothing is printed that is a secret.
 
 ```mermaid
 flowchart TD
-    A[bootstrap: first admin] --> B[client create gatekeeper, confidential, token-exchange]
-    B --> C[secret printed once, stored in the vault]
-    C --> D[exchange set gatekeeper to each service audience]
-    D --> E[client role: roles for service clients]
-    E --> F[client add-uri for each redirect URI]
+    A[Job starts: SETUP_CONFIG, Secrets] --> B{admin in config}
+    B -->|yes| C{any admin exists}
+    C -->|no| D[create admin, must_change_password]
+    C -->|yes| E[skip admin]
+    B -->|no| F[clients]
+    D --> F
+    E --> F
+    F --> G[create or merge each client, set secret hash]
+    G --> H[exchange policies upsert]
+    H --> I[done: remove the setup block from mm-deploy]
 ```
+
+What the Job does not do (use the admin app or the gRPC API): more users, roles and permissions, MFA,
+password resets, rotating a client secret, later clients. The admin app cannot add URIs to an
+existing client (no update call); to add one, put the `setup:` block back with the new URI.
 
 ## 4. Authorization code flow with PKCE (browser login)
 
@@ -205,12 +218,15 @@ Steps in the function, in order:
      password").
    - `password.Verify`, then `state.Reset` of the e-mail counter.
 3. The old `sid` session of the browser is ended (`acct.EndSession`): no session fixation.
-4. `acct.MFARequirement(user)` decides:
+4. When `user.MustChangePassword` (an admin created by the setup Job, see section 3): no session yet.
+   `state.SaveChallenge` with `Purpose = password`, redirect to `/login/password?c=<id>`
+   (section 4.4). The steps below run after the new password was set (`continueLogin`).
+5. `acct.MFARequirement(user)` decides (`continueLogin`):
    - `Verify`: `state.SaveChallenge` (`amr=[pwd]`, no session yet), redirect to `/login/mfa`.
      The session is created only after both factors.
    - `Enroll`: `startSession` with `amr=[pwd]`, redirect to `/account/mfa?return_to=...`.
    - `NoMFA`: `startSession` with `amr=[pwd]`, redirect to `return_to`.
-5. `startSession` creates the Redis session (`state.CreateSession`) and sets the `sid` cookie
+6. `startSession` creates the Redis session (`state.CreateSession`) and sets the `sid` cookie
    (`HttpOnly`, `SameSite=Lax`, `__Host-` prefix and `Secure` outside local http).
 
 `return_to` is passed through `safeReturn`, which only accepts `/oauth2/authorize?...` and
@@ -247,6 +263,39 @@ sequenceDiagram
 5. Success: `state.DeleteChallenge`. If `Challenge.SessionID == ""` it was a login: `startSession`
    with `amr=[pwd, otp]`. Otherwise it was a step-up: `upgradeSession` adds `otp` to the
    existing session (`state.UpdateSession`, TTL kept). Then redirect to `safeReturn(ReturnTo)`.
+
+### 4.4 Forced password change — `passwordChangeForm`, `passwordChangeSubmit` (`pages.go`)
+
+For a user with `must_change_password` (the admin made by the setup Job). The password the user typed is
+temporary: somebody else knows it, so no session, MFA step or authorization code exists until it is replaced.
+
+1. `passwordChangeForm`: `state.PeekChallenge` must exist and have `Purpose == password` (a second factor
+   challenge is not accepted here, and a password challenge is refused by `/login/mfa`).
+2. `passwordChangeSubmit`: `csrfOK`, then `state.Attempt(id, 10)`. The user must still exist, be enabled and have
+   the flag. The two fields must be equal.
+3. `account.SetPassword(user, new, check=true)`: `password.Check` (policy, not the e-mail, not the same as the
+   old one), `store.SetUserPassword` (which also clears `must_change_password`), `RevokeUserAccess`, mail
+   "password changed".
+4. `state.DeleteChallenge`, reload the user, then `continueLogin` (the MFA requirement, the session, the redirect to
+   `return_to`). `authorize` also forces a login for a session whose user still has the flag.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant I as identity
+    participant R as Redis
+    participant P as Postgres
+
+    B->>I: POST /login (email, temporary password)
+    I->>P: UserByEmail, argon2id verify
+    I->>R: SaveChallenge purpose=password (5 min), no session
+    I-->>B: 303 /login/password?c=id
+    B->>I: POST /login/password (new password twice, csrf)
+    I->>R: Attempt(id, 10)
+    I->>P: SetUserPassword (clears must_change_password)
+    I->>R: DeleteChallenge, then MFA step or CreateSession
+    I-->>B: 303 return_to + Set-Cookie sid
+```
 
 ## 5. Token endpoint — `POST /oauth2/token`
 
@@ -371,7 +420,7 @@ For service to service calls. Confidential clients only.
 2. `store.ExchangePolicyFor(client, audience)` must exist (`access_denied` otherwise).
 3. Scope: `token.NarrowScope(requested, client scopes, policy.MaxScope)`.
 4. Permissions of the client: `store.ClientPermissions` (from the roles given with
-   `identityctl client role`), cut to the audience by `token.FilterPerms`.
+   the admin app or `AssignRole`, or `roles` in the setup config), cut to the audience by `token.FilterPerms`.
 5. `token.Service.Access` with `Subject = ClientID`.
 
 ### 5.5 Token exchange — `grantExchange` and `token.Service.Exchange`
@@ -647,7 +696,7 @@ anything else → Internal without details).
 | `GetUserMFA` | `identity:mfa:read` | |
 | `SetUserMFA`, `EnforceUserMFA`, `ResetUserMFA` | `identity:mfa:write` | Admin methods of `account` (turn off, enforce, reset and end sessions) |
 
-Note: there is no RPC to add a redirect URI to a client. That is only `identityctl client add-uri`.
+Note: there is no RPC to add a redirect URI to a client. That is only the setup Job (`redirect_uris` and `post_logout_uris` in `SETUP_CONFIG`, merged into the stored lists).
 
 ## 10. The gatekeeper (BFF) end to end
 
@@ -692,7 +741,7 @@ Fixed endpoints, registered in `bff.Server.Routes`:
 2. Redis and `session.New` with `GATEKEEPER_SESSION_KEY` (first key seals, the others only open).
 3. `oidcclient.Discover(GATEKEEPER_IDENTITY_ISSUER)` with `GATEKEEPER_CLIENT_ID` and
    `GATEKEEPER_CLIENT_SECRET`. The redirect URL is `GATEKEEPER_PUBLIC_URL/auth/callback` and must be
-   registered on the identity client (`identityctl client add-uri`).
+   registered on the identity client (`redirect_uris` in the setup config).
 4. `jwtx.NewRemoteKeySet` on the identity `jwks_uri` and a `Verifier` for issuer and
    `GATEKEEPER_AUDIENCE` (this must equal the `resource` of the gatekeeper client in identity).
 5. `tokenexchange.New` on the identity `token_endpoint`.
@@ -897,8 +946,7 @@ sequenceDiagram
 ```
 
 When the upstream is another service than identity (for example courier), the same steps apply:
-add an upstream, routes and an exchange policy (`identityctl exchange set --client gatekeeper
---audience <aud>`). A call that needs several gRPC methods belongs in one method of a service, not in the gatekeeper.
+add an upstream, routes and an exchange policy (an exchange policy `gatekeeper -> <aud>`, in the admin app or `exchange_policies` of the setup config). A call that needs several gRPC methods belongs in one method of a service, not in the gatekeeper.
 
 ## 11. Security properties and where they are enforced
 
