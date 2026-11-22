@@ -140,11 +140,11 @@ setup:
       command: ["/identity-setup"]
       resources:
         limits:
-          cpu: 200m
-          memory: 128Mi
+          cpu: 500m
+          memory: 256Mi
         requests:
-          cpu: 50m
-          memory: 64Mi
+          cpu: 100m
+          memory: 192Mi
   # Existing Secrets (mm-ansible): mm-deploy lists POSTGRES_PASSWORD, SETUP_ADMIN_PASSWORD and one variable
   # per confidential client (named by secret_env in SETUP_CONFIG).
   secrets: []
