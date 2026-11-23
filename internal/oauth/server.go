@@ -1,19 +1,22 @@
 // Package oauth is the HTTP side of identity: OpenID Connect discovery and JWKS, authorize,
-// login (password and second factor), token, revoke, introspect, userinfo, logout, password
-// reset and the account MFA page.
+// token, revoke, introspect, userinfo and logout, plus the sign in pages: a React app (built by the web
+// repository, found in Config.UIDir) served for the page paths, and the JSON endpoints it calls under
+// /auth-api (login, second factor, password reset, account MFA, sign out).
 package oauth
 
 import (
 	"crypto/subtle"
-	"html/template"
+	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/huponx/gocommon/logging"
 	"github.com/huponx/identity/internal/account"
+	"github.com/huponx/identity/internal/appconfig"
 	"github.com/huponx/identity/internal/keys"
 	"github.com/huponx/identity/internal/password"
 	"github.com/huponx/identity/internal/state"
@@ -26,13 +29,20 @@ import (
 type Config struct {
 	Issuer string
 	// SecureCookies sets the Secure attribute and the __Host- prefix (always, except local http).
-	SecureCookies      bool
-	SessionIdle        time.Duration
-	SessionAbsolute    time.Duration
-	MFAMode            string
+	SecureCookies   bool
+	SessionIdle     time.Duration
+	SessionAbsolute time.Duration
+	MFAMode         string
+	// Apps are listed on /apps (IDENTITY_APPS).
+	Apps               []appconfig.AppLink
 	TrustedProxies     []string
 	AccessTokenDefault time.Duration
 	RefreshTokenTTL    time.Duration
+	// UIDir holds the built sign in app (index.html, assets/). Without it the pages answer 503.
+	UIDir string
+	// RequireUI makes Routes fail when UIDir has no index.html (outside local runs: a service without
+	// its sign in pages must not start).
+	RequireUI bool
 }
 
 // Server serves the endpoints.
@@ -45,6 +55,8 @@ type Server struct {
 	keys   *keys.Set
 	log    *zap.Logger
 	now    func() time.Time
+	// index is index.html of the sign in app (nil when it is not installed)
+	index []byte
 }
 
 // New builds the server.
@@ -61,7 +73,7 @@ func (s *Server) Routes(r *gin.Engine) error {
 	if err := r.SetTrustedProxies(s.cfg.TrustedProxies); err != nil {
 		return err
 	}
-	r.Use(securityHeaders(), limitBody(64<<10))
+	r.Use(securityHeaders(appconfig.IconOrigins(s.cfg.Apps)), limitBody(64<<10))
 
 	r.GET("/.well-known/openid-configuration", s.discovery)
 	r.GET("/.well-known/jwks.json", s.jwks)
@@ -75,22 +87,56 @@ func (s *Server) Routes(r *gin.Engine) error {
 	r.GET("/userinfo", s.userinfo)
 	r.POST("/userinfo", s.userinfo)
 
-	r.GET("/login", s.loginForm)
-	r.POST("/login", s.loginSubmit)
-	r.GET("/login/mfa", s.mfaForm)
-	r.POST("/login/mfa", s.mfaSubmit)
-	r.GET("/login/password", s.passwordChangeForm)
-	r.POST("/login/password", s.passwordChangeSubmit)
+	s.authAPI(r)
+	return s.pages(r)
+}
 
-	r.GET("/password/forgot", s.forgotForm)
-	r.POST("/password/forgot", s.forgotSubmit)
-	r.GET("/password/reset", s.resetForm)
-	r.POST("/password/reset", s.resetSubmit)
-
-	r.GET("/account/mfa", s.accountMFA)
-	r.POST("/account/mfa", s.accountMFAConfirm)
-	r.POST("/account/mfa/disable", s.accountMFADisable)
+// pages serves the sign in app: its index.html for every page path (the app routes itself) and its files.
+func (s *Server) pages(r *gin.Engine) error {
+	if s.cfg.UIDir != "" {
+		if b, err := os.ReadFile(filepath.Join(s.cfg.UIDir, "index.html")); err == nil {
+			s.index = b
+		}
+	}
+	if s.index == nil {
+		if s.cfg.RequireUI {
+			return fmt.Errorf("the sign in pages are missing: no index.html in IDENTITY_UI_DIR %q", s.cfg.UIDir)
+		}
+		s.log.Warn("the sign in pages are not installed (IDENTITY_UI_DIR has no index.html): the page paths answer 503", zap.String("dir", s.cfg.UIDir))
+	}
+	// the bare address: the applications for a signed in user, the sign in page for the others
+	r.GET("/", func(c *gin.Context) {
+		if _, user, _ := s.sessionFrom(c); user != nil {
+			c.Redirect(http.StatusFound, "/apps")
+			return
+		}
+		c.Redirect(http.StatusFound, "/login")
+	})
+	// the page paths of the app; e-mailed links and return_to values use them
+	for _, p := range []string{"/login", "/login/mfa", "/login/password", "/password/forgot", "/password/reset", "/account/mfa", "/apps", "/logout", "/error"} {
+		r.GET(p, s.spa)
+	}
+	if s.index != nil {
+		// Vite names the files after their content: cache for ever
+		assets := r.Group("/assets", func(c *gin.Context) {
+			c.Header("Cache-Control", "public, max-age=31536000, immutable")
+			c.Next()
+		})
+		assets.StaticFS("/", gin.Dir(filepath.Join(s.cfg.UIDir, "assets"), false)) // no directory listing
+		for _, f := range []string{"logo.svg", "theme-init.js"} {
+			path := filepath.Join(s.cfg.UIDir, f)
+			r.GET("/"+f, func(c *gin.Context) { c.File(path) })
+		}
+	}
 	return nil
+}
+
+func (s *Server) spa(c *gin.Context) {
+	if s.index == nil {
+		c.String(http.StatusServiceUnavailable, "The sign in pages are not available.")
+		return
+	}
+	c.Data(http.StatusOK, "text/html; charset=utf-8", s.index)
 }
 
 // ---- cookies ----
@@ -119,8 +165,6 @@ func (s *Server) cookie(c *gin.Context, name string) string {
 
 // ---- CSRF (double submit cookie plus Origin check) ----
 
-const csrfField = "csrf"
-
 // csrfToken returns the token of this browser, creating the cookie on the first visit.
 func (s *Server) csrfToken(c *gin.Context) string {
 	if v := s.cookie(c, "csrf"); len(v) >= 32 {
@@ -131,12 +175,11 @@ func (s *Server) csrfToken(c *gin.Context) string {
 	return v
 }
 
-// csrfOK checks a state changing request: the form token equals the cookie, and when the
+// csrfOK checks a state changing request: the token of the request body equals the cookie, and when the
 // browser sends an Origin it is ours.
-func (s *Server) csrfOK(c *gin.Context) bool {
+func (s *Server) csrfOK(c *gin.Context, token string) bool {
 	cookie := s.cookie(c, "csrf")
-	form := c.PostForm(csrfField)
-	if len(cookie) < 32 || subtle.ConstantTimeCompare([]byte(cookie), []byte(form)) != 1 {
+	if len(cookie) < 32 || subtle.ConstantTimeCompare([]byte(cookie), []byte(token)) != 1 {
 		return false
 	}
 	if origin := c.GetHeader("Origin"); origin != "" && origin != "null" {
@@ -155,15 +198,17 @@ func (s *Server) origin() string {
 
 // ---- middleware ----
 
-func securityHeaders() gin.HandlerFunc {
+func securityHeaders(iconOrigins []string) gin.HandlerFunc {
+	img := strings.Join(append([]string{"'self'", "data:"}, iconOrigins...), " ")
 	return func(c *gin.Context) {
 		h := c.Writer.Header()
 		h.Set("Cache-Control", "no-store")
 		h.Set("Pragma", "no-cache")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("X-Content-Type-Options", "nosniff") // existing standard header, not a new x- name
-		// no form-action: browsers apply it to the redirects that follow a POST as well
-		h.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src data:; frame-ancestors 'none'; base-uri 'none'")
+		// the sign in app is script and style files of this origin (no inline code), its API is this origin, the
+		// QR code of the MFA enrollment is a data: image, the icons of the applications come from their origins
+		h.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; img-src "+img+"; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 		c.Next()
 	}
 }
@@ -175,100 +220,21 @@ func limitBody(n int64) gin.HandlerFunc {
 	}
 }
 
-// ---- rendering ----
+// ---- errors of the browser endpoints ----
 
-type page struct {
-	Title    string
-	Message  string // error or notice
-	Notice   bool   // Message is not an error
-	CSRF     string
-	ReturnTo string
-	Fields   map[string]string
-	Data     any
-}
-
-var tmpl = template.Must(template.New("").Parse(`
-{{define "head"}}<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{.Title}}</title><style>
-body{font:16px/1.4 system-ui,sans-serif;background:#f4f5f7;margin:0;display:flex;min-height:100vh;align-items:center;justify-content:center}
-main{background:#fff;padding:2rem;border-radius:8px;box-shadow:0 1px 4px #0002;width:min(24rem,92vw)}
-h1{font-size:1.3rem;margin-top:0}label{display:block;margin:.8rem 0 .2rem}
-input[type=text],input[type=password],input[type=email]{width:100%;padding:.55rem;box-sizing:border-box;border:1px solid #999;border-radius:4px}
-button{margin-top:1rem;padding:.6rem 1rem;border:0;border-radius:4px;background:#1a56db;color:#fff;font-size:1rem;cursor:pointer}
-.err{color:#b00020}.ok{color:#146c2e}code{word-break:break-all}a{color:#1a56db}ul{padding-left:1.2rem}
-</style></head><body><main><h1>{{.Title}}</h1>{{if .Message}}<p class="{{if .Notice}}ok{{else}}err{{end}}" role="alert">{{.Message}}</p>{{end}}{{end}}
-{{define "foot"}}</main></body></html>{{end}}
-
-{{define "login"}}{{template "head" .}}<form method="post" action="/login">
-<input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="return_to" value="{{.ReturnTo}}">
-<label for="email">E-mail</label><input id="email" type="email" name="email" value="{{.Fields.email}}" autocomplete="username" required autofocus>
-<label for="pw">Password</label><input id="pw" type="password" name="password" autocomplete="current-password" required>
-<button type="submit">Sign in</button></form><p><a href="/password/forgot">Forgot your password?</a></p>{{template "foot"}}{{end}}
-
-{{define "mfa"}}{{template "head" .}}<form method="post" action="/login/mfa">
-<input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="c" value="{{.Fields.c}}">
-<label for="code">Code from your authenticator app, or a recovery code</label>
-<input id="code" type="text" name="code" inputmode="text" autocomplete="one-time-code" required autofocus>
-<button type="submit">Verify</button></form>{{template "foot"}}{{end}}
-
-{{define "password-change"}}{{template "head" .}}<form method="post" action="/login/password">
-<input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="c" value="{{.Fields.c}}">
-<label for="pw">New password (at least 12 characters)</label><input id="pw" type="password" name="password" autocomplete="new-password" minlength="12" required autofocus>
-<label for="pw2">Repeat the new password</label><input id="pw2" type="password" name="password2" autocomplete="new-password" minlength="12" required>
-<button type="submit">Set the password</button></form>{{template "foot"}}{{end}}
-
-{{define "forgot"}}{{template "head" .}}{{if not .Notice}}<form method="post" action="/password/forgot">
-<input type="hidden" name="csrf" value="{{.CSRF}}"><label for="email">E-mail</label>
-<input id="email" type="email" name="email" autocomplete="username" required autofocus><button type="submit">Send the link</button></form>{{end}}
-<p><a href="/login">Back to sign in</a></p>{{template "foot"}}{{end}}
-
-{{define "reset"}}{{template "head" .}}<form method="post" action="/password/reset">
-<input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="token" value="{{.Fields.token}}">
-<label for="pw">New password (at least 12 characters)</label><input id="pw" type="password" name="password" autocomplete="new-password" minlength="12" required autofocus>
-<button type="submit">Set the password</button></form>{{template "foot"}}{{end}}
-
-{{define "message"}}{{template "head" .}}{{if .ReturnTo}}<p><a href="{{.ReturnTo}}">Continue</a></p>{{end}}{{template "foot"}}{{end}}
-
-{{define "confirm-logout"}}{{template "head" .}}<form method="post" action="/oauth2/logout">
-<input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="post_logout_redirect_uri" value="{{.Fields.post_logout_redirect_uri}}">
-<input type="hidden" name="state" value="{{.Fields.state}}"><input type="hidden" name="client_id" value="{{.Fields.client_id}}">
-<button type="submit">Sign out</button></form>{{template "foot"}}{{end}}
-
-{{define "mfa-enroll"}}{{template "head" .}}<p>Scan the code with an authenticator app, then enter the 6 digit code it shows.</p>
-<p><img src="{{.Data.QRData}}" alt="QR code" width="224" height="224"></p><p>Or type this key: <code>{{.Data.Secret}}</code></p>
-<form method="post" action="/account/mfa"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="return_to" value="{{.ReturnTo}}">
-<label for="code">Code</label><input id="code" type="text" name="code" inputmode="numeric" autocomplete="one-time-code" required autofocus>
-<button type="submit">Turn on</button></form>{{template "foot"}}{{end}}
-
-{{define "mfa-codes"}}{{template "head" .}}<p>Multi-factor authentication is on. Keep these recovery codes in a safe place: each works once, and they are not shown again.</p>
-<ul>{{range .Data}}<li><code>{{.}}</code></li>{{end}}</ul><p><a href="{{.ReturnTo}}">Continue</a></p>{{template "foot"}}{{end}}
-
-{{define "mfa-status"}}{{template "head" .}}<p>Multi-factor authentication is <strong>on</strong>. Recovery codes left: {{.Data.CodesLeft}}.</p>
-{{if .Data.Forced}}<p>It is required for your account and cannot be turned off.</p>{{else}}
-<form method="post" action="/account/mfa/disable"><input type="hidden" name="csrf" value="{{.CSRF}}">
-<label for="pw">Password</label><input id="pw" type="password" name="password" autocomplete="current-password" required>
-<label for="code">Code or recovery code</label><input id="code" type="text" name="code" autocomplete="one-time-code" required>
-<button type="submit">Turn off</button></form>{{end}}{{template "foot"}}{{end}}
-`))
-
-func (s *Server) render(c *gin.Context, status int, name string, p page) {
-	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.Status(status)
-	if err := tmpl.ExecuteTemplate(c.Writer, name, p); err != nil {
-		logging.FromCtx(c.Request.Context()).Error("render", zap.String("template", name), zap.Error(err))
-	}
-}
-
-func (s *Server) errorPage(c *gin.Context, status int, msg string) {
-	s.render(c, status, "message", page{Title: "Something went wrong", Message: msg})
+// errorPage sends the browser to the error page of the sign in app. Only a fixed code travels in the URL
+// (unknown_client, bad_redirect, bad_request, not_found, internal): the app has the texts, so nothing that
+// came from the request is ever shown.
+func (s *Server) errorPage(c *gin.Context, code string) {
+	c.Redirect(http.StatusFound, "/error?e="+url.QueryEscape(code))
 }
 
 // safeReturn only accepts local paths we send people to, so return_to is never an open redirect.
 func safeReturn(rt string) string {
-	for _, p := range []string{"/oauth2/authorize?", "/account/mfa"} {
+	for _, p := range []string{"/oauth2/authorize?", "/account/mfa", "/apps"} {
 		if strings.HasPrefix(rt, p) && !strings.ContainsAny(rt, "\\\r\n") && !strings.HasPrefix(rt, "//") {
 			return rt
 		}
 	}
-	return "/account/mfa"
+	return "/apps" // nobody sent the user here: the list of applications
 }

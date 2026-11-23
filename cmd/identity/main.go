@@ -105,10 +105,15 @@ func main() {
 		healthz.Check{Name: "postgres", Fn: st.Ping},
 		healthz.Check{Name: "redis", Fn: sta.Ping},
 	))
+	apps, err := cfg.AppLinks() // validated above
+	if err != nil {
+		panic(err)
+	}
 	web := oauth.New(oauth.Config{
 		Issuer: cfg.Issuer, SecureCookies: !cfg.IsLocal() || startsHTTPS(cfg.Issuer),
 		SessionIdle: cfg.SessionIdleTTL, SessionAbsolute: cfg.SessionAbsoluteTTL, MFAMode: cfg.MFAMode,
 		TrustedProxies: cfg.TrustedProxies, AccessTokenDefault: cfg.AccessTokenTTL, RefreshTokenTTL: cfg.RefreshTokenTTL,
+		UIDir: cfg.UIDir, RequireUI: !cfg.IsLocal(), Apps: apps,
 	}, acct, st, sta, tokens, keySet, log)
 	if err := web.Routes(router); err != nil {
 		log.Fatal("http routes", zap.Error(err))
