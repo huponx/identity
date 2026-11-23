@@ -7,6 +7,7 @@ import (
 
 	"github.com/huponx/gocommon/apperror"
 	"github.com/huponx/gocommon/authz"
+	"github.com/huponx/gocommon/pagination"
 	"github.com/huponx/identity/internal/store"
 	identityv1 "github.com/huponx/protogen/go/identity/v1"
 )
@@ -33,11 +34,11 @@ func checkDescription(d string) error {
 }
 
 func (s *Service) ListPermissions(ctx context.Context, req *identityv1.ListPermissionsRequest) (*identityv1.ListPermissionsResponse, error) {
-	size, err := pageSize(req.GetPageSize())
+	size, err := pagination.Size(req.GetPageSize())
 	if err != nil {
 		return nil, err
 	}
-	after, err := decodePageToken(req.GetPageToken(), 1)
+	after, err := pagination.Decode(req.GetPageToken(), 1)
 	if err != nil {
 		return nil, err
 	}
@@ -52,7 +53,7 @@ func (s *Service) ListPermissions(ctx context.Context, req *identityv1.ListPermi
 	out := &identityv1.ListPermissionsResponse{Total: total}
 	if len(list) > size {
 		list = list[:size]
-		out.NextPageToken = encodePageToken(list[size-1].Name)
+		out.NextPageToken = pagination.Encode(list[size-1].Name)
 	}
 	for _, p := range list {
 		out.Permissions = append(out.Permissions, toPermission(p))

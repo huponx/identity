@@ -15,6 +15,11 @@ func TestAppLinks(t *testing.T) {
 	if err != nil || len(got) != 2 || got[0] != (AppLink{Name: "Admin", URL: "http://localhost:3002"}) || got[1] != (AppLink{Name: "Bill", URL: "https://bill.example"}) {
 		t.Fatalf("%v %v", got, err)
 	}
+	// one entry per line (a YAML block scalar), a name with a space
+	got, err = ident("local", "Admin Portal=https://admin.example|https://admin.example/logo.svg\nDict=https://dict.example\n").AppLinks()
+	if err != nil || len(got) != 2 || got[0].Name != "Admin Portal" || got[0].Icon != "https://admin.example/logo.svg" || got[1].Name != "Dict" {
+		t.Fatalf("lines: %v %v", got, err)
+	}
 	got, err = ident("local", "A=https://a.example|https://cdn.example/a.svg", "B=https://b.example|https://cdn.example/b.svg").AppLinks()
 	if err != nil || got[0].Icon != "https://cdn.example/a.svg" {
 		t.Fatalf("icon: %v %v", got, err)
