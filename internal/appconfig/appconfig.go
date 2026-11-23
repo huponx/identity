@@ -75,7 +75,7 @@ type Identity struct {
 	UIDir string `env:"IDENTITY_UI_DIR" envDefault:"/ui"`
 
 	// Apps are the applications listed on /apps, the page a user lands on after signing in at identity itself
-	// (no application sent them): "Name=https://url" entries, comma separated, each with an optional icon
+	// (no application sent them): "Name=https://url" entries, separated by commas or new lines, each with an optional icon
 	// "Name=https://url|https://icon.example/logo.svg".
 	Apps []string `env:"IDENTITY_APPS" envSeparator:","`
 }
@@ -118,11 +118,7 @@ func (c Identity) okURL(u string) bool {
 // AppLinks parses IDENTITY_APPS.
 func (c Identity) AppLinks() ([]AppLink, error) {
 	var out []AppLink
-	for _, e := range c.Apps {
-		e = strings.TrimSpace(e)
-		if e == "" {
-			continue
-		}
+	for _, e := range config.Lines(c.Apps) { // comma or new line separated
 		name, u, ok := strings.Cut(e, "=")
 		u, icon, _ := strings.Cut(u, "|")
 		name, u, icon = strings.TrimSpace(name), strings.TrimSpace(u), strings.TrimSpace(icon)
