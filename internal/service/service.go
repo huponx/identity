@@ -67,6 +67,8 @@ var Permissions = map[string]string{
 	"/identity.v1.IdentityService/SetUserMFA":           "identity:mfa:write",
 	"/identity.v1.IdentityService/EnforceUserMFA":       "identity:mfa:write",
 	"/identity.v1.IdentityService/ResetUserMFA":         "identity:mfa:write",
+	"/identity.v1.IdentityService/GetUIStyle":           grpcserver.Public,
+	"/identity.v1.IdentityService/SetUIStyle":           "identity:settings:write",
 }
 
 // Service is the gRPC implementation.
