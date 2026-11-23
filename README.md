@@ -55,7 +55,7 @@ Permissions are colon separated segments with segment wildcards: `*` alone match
 | `IDENTITY_MFA_ISSUER_NAME` | `Example` | label in authenticator apps |
 | `IDENTITY_AUTH_AUDIENCE` | `identity` | `aud` accepted by the gRPC API |
 | `IDENTITY_TRUSTED_PROXIES` | empty | CIDRs of the ingress, for the client IP of the rate limits |
-| `IDENTITY_APPS` | empty | `Name=https://url` or `Name=https://url|https://icon` entries, comma separated: the applications of `/apps` (the icon is optional; its origin is added to the `img-src` of the CSP), where a user lands after signing in at identity itself (no `return_to`) |
+| `IDENTITY_APPS` | empty | `Name=https://url` or `Name=https://url|https://icon` entries, one per line in a YAML block scalar (`|-`) or comma separated: the applications of `/apps` (the icon is optional; its origin is added to the `img-src` of the CSP), where a user lands after signing in at identity itself (no `return_to`) |
 | `IDENTITY_UI_DIR` | `/ui` | build of the sign in app (`web/apps/auth`; the image carries it). Required unless `ENV=local`, where the page paths answer 503 without it |
 | `COURIER_TARGET`, `COURIER_TOKEN_FILE` | empty | e-mails; empty disables them (links are logged when `ENV=local`) |
 | `POSTGRES_*`, `REDIS_*`, `HOST`, `ENV`, `LOG_*` | | gocommon blocks |

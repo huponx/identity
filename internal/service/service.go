@@ -11,6 +11,7 @@ import (
 	"github.com/huponx/gocommon/authn"
 	"github.com/huponx/gocommon/authz"
 	"github.com/huponx/gocommon/grpcserver"
+	"github.com/huponx/gocommon/pagination"
 	"github.com/huponx/identity/internal/account"
 	"github.com/huponx/identity/internal/appconfig"
 	"github.com/huponx/identity/internal/oauth"
@@ -271,11 +272,11 @@ func statusFilter(s identityv1.UserStatus) string {
 // ListUsers pages through the users ordered by email. The page token is the last email of the
 // previous page (opaque to callers).
 func (s *Service) ListUsers(ctx context.Context, req *identityv1.ListUsersRequest) (*identityv1.ListUsersResponse, error) {
-	size, err := pageSize(req.GetPageSize())
+	size, err := pagination.Size(req.GetPageSize())
 	if err != nil {
 		return nil, err
 	}
-	after, err := decodePageToken(req.GetPageToken(), 1)
+	after, err := pagination.Decode(req.GetPageToken(), 1)
 	if err != nil {
 		return nil, err
 	}
@@ -289,7 +290,7 @@ func (s *Service) ListUsers(ctx context.Context, req *identityv1.ListUsersReques
 	out := &identityv1.ListUsersResponse{}
 	if len(users) > size {
 		users = users[:size]
-		out.NextPageToken = encodePageToken(users[size-1].Email)
+		out.NextPageToken = pagination.Encode(users[size-1].Email)
 	}
 	for i := range users {
 		out.Users = append(out.Users, toUser(&users[i], roles[users[i].ID]))
@@ -487,11 +488,11 @@ func (s *Service) DeleteRole(ctx context.Context, req *identityv1.DeleteRoleRequ
 }
 
 func (s *Service) ListRoles(ctx context.Context, req *identityv1.ListRolesRequest) (*identityv1.ListRolesResponse, error) {
-	size, err := pageSize(req.GetPageSize())
+	size, err := pagination.Size(req.GetPageSize())
 	if err != nil {
 		return nil, err
 	}
-	after, err := decodePageToken(req.GetPageToken(), 1)
+	after, err := pagination.Decode(req.GetPageToken(), 1)
 	if err != nil {
 		return nil, err
 	}
@@ -506,7 +507,7 @@ func (s *Service) ListRoles(ctx context.Context, req *identityv1.ListRolesReques
 	out := &identityv1.ListRolesResponse{Total: total}
 	if len(roles) > size {
 		roles = roles[:size]
-		out.NextPageToken = encodePageToken(roles[size-1].Name)
+		out.NextPageToken = pagination.Encode(roles[size-1].Name)
 	}
 	for _, r := range roles {
 		out.Roles = append(out.Roles, toRole(r))
@@ -708,11 +709,11 @@ func clientTypeName(t identityv1.ClientType) string {
 }
 
 func (s *Service) ListClients(ctx context.Context, req *identityv1.ListClientsRequest) (*identityv1.ListClientsResponse, error) {
-	size, err := pageSize(req.GetPageSize())
+	size, err := pagination.Size(req.GetPageSize())
 	if err != nil {
 		return nil, err
 	}
-	after, err := decodePageToken(req.GetPageToken(), 1)
+	after, err := pagination.Decode(req.GetPageToken(), 1)
 	if err != nil {
 		return nil, err
 	}
@@ -723,7 +724,7 @@ func (s *Service) ListClients(ctx context.Context, req *identityv1.ListClientsRe
 	out := &identityv1.ListClientsResponse{}
 	if len(cs) > size {
 		cs = cs[:size]
-		out.NextPageToken = encodePageToken(cs[size-1].ClientID)
+		out.NextPageToken = pagination.Encode(cs[size-1].ClientID)
 	}
 	for _, c := range cs {
 		out.Clients = append(out.Clients, toClient(c))
@@ -757,11 +758,11 @@ func (s *Service) SetExchangePolicy(ctx context.Context, req *identityv1.SetExch
 }
 
 func (s *Service) ListExchangePolicies(ctx context.Context, req *identityv1.ListExchangePoliciesRequest) (*identityv1.ListExchangePoliciesResponse, error) {
-	size, err := pageSize(req.GetPageSize())
+	size, err := pagination.Size(req.GetPageSize())
 	if err != nil {
 		return nil, err
 	}
-	after, err := decodePageToken(req.GetPageToken(), 2)
+	after, err := pagination.Decode(req.GetPageToken(), 2)
 	if err != nil {
 		return nil, err
 	}
@@ -775,7 +776,7 @@ func (s *Service) ListExchangePolicies(ctx context.Context, req *identityv1.List
 	out := &identityv1.ListExchangePoliciesResponse{}
 	if len(ps) > size {
 		ps = ps[:size]
-		out.NextPageToken = encodePageToken(ps[size-1].ClientID, ps[size-1].Audience)
+		out.NextPageToken = pagination.Encode(ps[size-1].ClientID, ps[size-1].Audience)
 	}
 	for _, p := range ps {
 		out.Policies = append(out.Policies, &identityv1.ExchangePolicy{
