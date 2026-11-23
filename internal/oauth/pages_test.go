@@ -114,7 +114,7 @@ func TestAuthAPICSRF(t *testing.T) {
 	}
 	// every POST step refuses a request without a matching token, before any lookup
 	for _, p := range []string{"/auth-api/login", "/auth-api/login/mfa", "/auth-api/login/password", "/auth-api/password/forgot",
-		"/auth-api/password/reset", "/auth-api/logout"} {
+		"/auth-api/password/reset", "/auth-api/logout", "/auth-api/preferences"} {
 		if w := do(r, "POST", p, `{"csrf":"wrong"}`, jsonHdr("https://id.example")); w.Code != 403 || code(w) != "csrf_expired" {
 			t.Errorf("%s with a wrong token: %d %s", p, w.Code, w.Body.String())
 		}
@@ -129,7 +129,7 @@ func TestAuthAPICSRF(t *testing.T) {
 		}
 	}
 	// the account steps need a session first
-	for _, p := range []string{"/auth-api/account/mfa", "/auth-api/account/mfa/disable"} {
+	for _, p := range []string{"/auth-api/account/mfa", "/auth-api/account/mfa/disable", "/auth-api/preferences"} {
 		if w := do(r, "POST", p, `{"csrf":"`+out.CSRF+`"}`, jsonHdr("https://id.example")); w.Code != 401 || code(w) != "unauthenticated" {
 			t.Errorf("%s without a session: %d %s", p, w.Code, w.Body.String())
 		}

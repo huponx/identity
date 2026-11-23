@@ -119,6 +119,8 @@ func (s *Server) authAPI(r *gin.Engine) {
 
 	a.POST("/logout", s.apiLogout)
 	a.GET("/apps", s.apiApps)
+	a.GET("/preferences", s.apiPreferences)
+	a.POST("/preferences", s.apiSetPreferences)
 }
 
 // apiApps lists the applications of the signed in user's landing page (and whether the link to the MFA page is shown: only for an account that must use MFA and has not set it up yet).
@@ -135,6 +137,39 @@ func (s *Server) apiApps(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"apps": apps, "name": user.Name, "email": user.Email, "theme": user.Theme, "mfa": s.cfg.MFAMode != appconfig.MFAOff && s.acct.MFAForced(user) && !user.MFAEnabled})
 }
 
+// apiPreferences answers the theme and the language of the signed in user's account, which the pages keep in step with the apps.
+func (s *Server) apiPreferences(c *gin.Context) {
+	_, user, _ := s.sessionFrom(c)
+	if user == nil {
+		s.apiError(c, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"theme": user.Theme, "locale": user.Locale})
+}
+
+// apiSetPreferences stores the theme and/or the language the signed in user picked on these pages.
+func (s *Server) apiSetPreferences(c *gin.Context) {
+	var req struct {
+		csrfBody
+		Theme  string `json:"theme"`
+		Locale string `json:"locale"`
+	}
+	if !s.readJSON(c, &req) {
+		return
+	}
+	_, user, _ := s.sessionFrom(c)
+	if user == nil {
+		s.apiError(c, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	if (req.Theme != "" && !themeChoices[req.Theme]) || (req.Locale != "" && !localeChoices[req.Locale]) {
+		s.apiError(c, http.StatusBadRequest, "bad_request")
+		return
+	}
+	s.keepPreferences(c, user, req.Theme, req.Locale)
+	c.JSON(http.StatusOK, gin.H{"theme": user.Theme, "locale": user.Locale})
+}
+
 // ---- password login ----
 
 func (s *Server) apiLogin(c *gin.Context) {
@@ -144,6 +179,10 @@ func (s *Server) apiLogin(c *gin.Context) {
 		Email    string `json:"email"`
 		Password string `json:"password"`
 		ReturnTo string `json:"return_to"`
+		// what the user picked on this page before signing in (the pages are another origin than the apps, so
+		// the account is how the choice reaches them); empty when the user did not touch it
+		Theme  string `json:"theme"`
+		Locale string `json:"locale"`
 	}
 	if !s.readJSON(c, &req) {
 		return
@@ -161,6 +200,8 @@ func (s *Server) apiLogin(c *gin.Context) {
 		s.apiFail(c, err)
 		return
 	}
+
+	s.keepPreferences(c, user, req.Theme, req.Locale)
 
 	// a login always starts a new session (no session fixation)
 	if _, _, old := s.sessionFrom(c); old != "" {
@@ -185,7 +226,29 @@ func (s *Server) apiLogin(c *gin.Context) {
 		return
 	}
 	// the theme of the account: the app keeps it for the next visit of the pages (they are another origin than the apps)
-	c.JSON(http.StatusOK, gin.H{"redirect": to, "theme": user.Theme})
+	c.JSON(http.StatusOK, gin.H{"redirect": to, "theme": user.Theme, "locale": user.Locale})
+}
+
+var (
+	themeChoices  = map[string]bool{"light": true, "dark": true, "system": true}
+	localeChoices = map[string]bool{"en": true, "vi": true}
+)
+
+// keepPreferences stores the theme and the language the user picked on the sign in page in the account (an
+// unknown value is ignored) and updates `user`, which the answer is built from. Best effort: the password was
+// right, so a failed save must not fail the sign in.
+func (s *Server) keepPreferences(c *gin.Context, user *store.User, theme, locale string) {
+	ctx := c.Request.Context()
+	if themeChoices[theme] && theme != user.Theme {
+		if err := s.store.SetUserTheme(ctx, user.ID, theme); err == nil {
+			user.Theme = theme
+		}
+	}
+	if localeChoices[locale] && locale != user.Locale {
+		if err := s.store.UpdateUser(ctx, user.ID, user.Name, locale); err == nil {
+			user.Locale = locale
+		}
+	}
 }
 
 // ---- second factor at login ----
