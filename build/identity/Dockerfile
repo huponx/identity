@@ -6,7 +6,7 @@ ARG GO_VERSION=1.26
 # as the image auth-ui. Its files are copied into /ui, where identity serves them (IDENTITY_UI_DIR). The tag is
 # the version of the pages this release carries: bump it after a new release of the web repository (scripts/check-auth-ui.sh
 # fails a PR whose tag does not exist). The placeholder tag below does not exist on purpose: set it to a published one.
-ARG AUTH_UI_IMAGE=ghcr.io/huponx/auth-ui:v2026.11.5-release-05c18b1
+ARG AUTH_UI_IMAGE=ghcr.io/huponx/auth-ui:v2026.11.6-release-900fa75
 
 FROM ${AUTH_UI_IMAGE} AS ui
 
