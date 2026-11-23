@@ -157,3 +157,27 @@ func TestSafeReturn(t *testing.T) {
 		}
 	}
 }
+
+// The look of the web apps is readable without a session and defaults to saas.
+func TestUIStyleIsPublic(t *testing.T) {
+	r, err := newTestServer(t, installUI(t), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := do(r, "GET", "/auth-api/ui-style", "", nil)
+	if w.Code != 200 {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	var out struct {
+		UIStyle    string            `json:"uiStyle"`
+		UIPalettes map[string]string `json:"uiPalettes"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil || out.UIStyle != "saas" {
+		t.Errorf("body %q: %v", w.Body.String(), err)
+	}
+	for _, st := range []string{"saas", "glass", "mono"} {
+		if out.UIPalettes[st] != "aurora" {
+			t.Errorf("palette of %s: %q", st, out.UIPalettes[st])
+		}
+	}
+}

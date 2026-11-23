@@ -119,6 +119,7 @@ func (s *Server) authAPI(r *gin.Engine) {
 
 	a.POST("/logout", s.apiLogout)
 	a.GET("/apps", s.apiApps)
+	a.GET("/ui-style", s.apiUIStyle)
 	a.GET("/preferences", s.apiPreferences)
 	a.POST("/preferences", s.apiSetPreferences)
 }
@@ -135,6 +136,32 @@ func (s *Server) apiApps(c *gin.Context) {
 		apps = []appconfig.AppLink{}
 	}
 	c.JSON(http.StatusOK, gin.H{"apps": apps, "name": user.Name, "email": user.Email, "theme": user.Theme, "mfa": s.cfg.MFAMode != appconfig.MFAOff && s.acct.MFAForced(user) && !user.MFAEnabled})
+}
+
+// apiUIStyle answers the look of the web apps and the palette of each look (set by an administrator for the whole
+// system). No session: the sign in pages show it before anybody is signed in. A missing or unknown value is the
+// default: "saas" and "aurora".
+func (s *Server) apiUIStyle(c *gin.Context) {
+	style, err := "saas", error(nil)
+	stored := map[string]string{}
+	if s.store != nil {
+		ctx := c.Request.Context()
+		if style, err = s.store.UIStyle(ctx, "saas"); err == nil {
+			stored, err = s.store.UIPalettes(ctx)
+		}
+	}
+	if err != nil || (style != "saas" && style != "glass" && style != "mono") {
+		style = "saas"
+	}
+	palettes := map[string]string{}
+	for _, st := range []string{"saas", "glass", "mono"} {
+		palettes[st] = "aurora"
+		switch p := stored[st]; p {
+		case "ocean", "sunset", "mint", "rose", "graphite":
+			palettes[st] = p
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"uiStyle": style, "uiPalettes": palettes})
 }
 
 // apiPreferences answers the theme and the language of the signed in user's account, which the pages keep in step with the apps.
