@@ -1,7 +1,6 @@
 package oauth
 
 import (
-	"errors"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -115,12 +114,12 @@ func (s *Server) authorize(c *gin.Context) {
 	// 1. client and redirect_uri: until both are trusted nothing is redirected
 	client, err := s.store.ClientByID(ctx, q.Get("client_id"))
 	if err != nil || client.Disabled {
-		s.errorPage(c, http.StatusBadRequest, "Unknown application.")
+		s.errorPage(c, "unknown_client")
 		return
 	}
 	redirectURI := q.Get("redirect_uri")
 	if !contains(client.RedirectURIs, redirectURI) {
-		s.errorPage(c, http.StatusBadRequest, "The redirect address is not registered for this application.")
+		s.errorPage(c, "bad_redirect")
 		return
 	}
 	stateParam := q.Get("state")
@@ -244,82 +243,30 @@ func cloneQuery(q url.Values) url.Values {
 
 func (s *Server) fail(c *gin.Context, err error) {
 	logging.FromCtx(c.Request.Context()).Error("request failed", zap.Error(err))
-	s.errorPage(c, http.StatusInternalServerError, "Something went wrong. Please try again.")
+	s.errorPage(c, "internal")
 }
 
-// ---- login ----
-
-func (s *Server) loginForm(c *gin.Context) {
-	s.render(c, http.StatusOK, "login", page{Title: "Sign in", CSRF: s.csrfToken(c), ReturnTo: safeReturn(c.Query("return_to")), Fields: map[string]string{}})
-}
-
-func (s *Server) loginSubmit(c *gin.Context) {
-	ctx := c.Request.Context()
-	ret := safeReturn(c.PostForm("return_to"))
-	form := func(status int, msg string, email string) {
-		s.render(c, status, "login", page{Title: "Sign in", Message: msg, CSRF: s.csrfToken(c), ReturnTo: ret, Fields: map[string]string{"email": email}})
-	}
-	if !s.csrfOK(c) {
-		form(http.StatusForbidden, "The form expired. Please try again.", "")
-		return
-	}
-	email := c.PostForm("email")
-	user, err := s.acct.PasswordLogin(ctx, email, c.PostForm("password"), c.ClientIP())
-	switch {
-	case errors.Is(err, account.ErrRateLimited):
-		form(http.StatusTooManyRequests, "Too many attempts. Please wait a few minutes.", email)
-		return
-	case errors.Is(err, account.ErrInvalidCredentials):
-		form(http.StatusUnauthorized, "Wrong e-mail or password.", email)
-		return
-	case err != nil:
-		s.fail(c, err)
-		return
-	}
-
-	// a login always starts a new session (no session fixation)
-	if _, _, old := s.sessionFrom(c); old != "" {
-		if sess, err := s.state.GetSession(ctx, old, s.cfg.SessionIdle, s.cfg.SessionAbsolute); err == nil {
-			_, _ = s.acct.EndSession(ctx, sess.PublicID)
-		}
-	}
-
-	if user.MustChangePassword {
-		// the password was set by somebody else: no session until the user chose their own
-		id := password.Random(24)
-		if err := s.state.SaveChallenge(ctx, id, state.Challenge{UserID: user.ID, ReturnTo: ret, Purpose: state.PurposePassword}); err != nil {
-			s.fail(c, err)
-			return
-		}
-		c.Redirect(http.StatusSeeOther, "/login/password?c="+url.QueryEscape(id))
-		return
-	}
-	s.continueLogin(c, user, ret)
-}
-
-// continueLogin runs the steps after the password: the second factor, then the session.
-func (s *Server) continueLogin(c *gin.Context, user *store.User, ret string) {
+// continueLogin runs the steps after the password: the second factor, then the session. It returns the
+// address the browser goes to next.
+func (s *Server) continueLogin(c *gin.Context, user *store.User, ret string) (string, error) {
 	ctx := c.Request.Context()
 	switch s.acct.MFARequirement(user) {
 	case account.Verify:
 		id := password.Random(24)
 		if err := s.state.SaveChallenge(ctx, id, state.Challenge{UserID: user.ID, ReturnTo: ret, AMR: []string{"pwd"}}); err != nil {
-			s.fail(c, err)
-			return
+			return "", err
 		}
-		c.Redirect(http.StatusSeeOther, "/login/mfa?c="+url.QueryEscape(id))
+		return "/login/mfa?c=" + url.QueryEscape(id), nil
 	case account.Enroll:
 		if err := s.startSession(c, user.ID, []string{"pwd"}); err != nil {
-			s.fail(c, err)
-			return
+			return "", err
 		}
-		c.Redirect(http.StatusSeeOther, "/account/mfa?return_to="+url.QueryEscape(ret))
+		return "/account/mfa?return_to=" + url.QueryEscape(ret), nil
 	default:
 		if err := s.startSession(c, user.ID, []string{"pwd"}); err != nil {
-			s.fail(c, err)
-			return
+			return "", err
 		}
-		c.Redirect(http.StatusSeeOther, ret)
+		return ret, nil
 	}
 }
 
@@ -332,79 +279,12 @@ func (s *Server) startSession(c *gin.Context, userID string, amr []string) error
 		return err
 	}
 	s.setCookie(c, "sid", cookie, int(s.cfg.SessionAbsolute.Seconds()))
+	// every completed sign in passes here (password, password + second factor, enrollment); a failure
+	// to record it must not stop the sign in
+	if err := s.store.TouchLogin(c.Request.Context(), userID); err != nil {
+		s.log.Warn("could not record the sign in", zap.String("user_id", userID), zap.Error(err))
+	}
 	return nil
-}
-
-// ---- second factor at login ----
-
-func (s *Server) mfaForm(c *gin.Context) {
-	id := c.Query("c")
-	if ch, err := s.state.PeekChallenge(c.Request.Context(), id); err != nil || ch.Purpose != "" {
-		c.Redirect(http.StatusSeeOther, "/login")
-		return
-	}
-	s.render(c, http.StatusOK, "mfa", page{Title: "Verification", CSRF: s.csrfToken(c), Fields: map[string]string{"c": id}})
-}
-
-func (s *Server) mfaSubmit(c *gin.Context) {
-	ctx := c.Request.Context()
-	id := c.PostForm("c")
-	again := func(status int, msg string) {
-		s.render(c, status, "mfa", page{Title: "Verification", Message: msg, CSRF: s.csrfToken(c), Fields: map[string]string{"c": id}})
-	}
-	if !s.csrfOK(c) {
-		again(http.StatusForbidden, "The form expired. Please try again.")
-		return
-	}
-	ch, err := s.state.Attempt(ctx, id, 5)
-	if err == nil && ch.Purpose != "" { // a password change challenge is not a second factor
-		err = state.ErrNotFound
-	}
-	if errors.Is(err, state.ErrNotFound) {
-		s.render(c, http.StatusUnauthorized, "login", page{Title: "Sign in", Message: "Too many wrong codes or the request expired. Please sign in again.",
-			CSRF: s.csrfToken(c), ReturnTo: "/account/mfa", Fields: map[string]string{}})
-		return
-	}
-	if err != nil {
-		s.fail(c, err)
-		return
-	}
-	user, err := s.store.UserByID(ctx, ch.UserID)
-	if err != nil || user.Disabled {
-		c.Redirect(http.StatusSeeOther, "/login")
-		return
-	}
-	if ok, err := s.state.Allow(ctx, "mfa:user:"+user.ID, 15, 10*time.Minute); err != nil {
-		s.fail(c, err)
-		return
-	} else if !ok {
-		again(http.StatusTooManyRequests, "Too many attempts. Please wait a few minutes.")
-		return
-	}
-	if _, err := s.acct.VerifySecondFactor(ctx, user, c.PostForm("code")); err != nil {
-		if errors.Is(err, account.ErrInvalidCode) {
-			again(http.StatusUnauthorized, "Wrong code.")
-			return
-		}
-		s.fail(c, err)
-		return
-	}
-	_ = s.state.DeleteChallenge(ctx, id)
-
-	if ch.SessionID == "" { // login: the session is created now, after both factors
-		if err := s.startSession(c, user.ID, []string{"pwd", "otp"}); err != nil {
-			s.fail(c, err)
-			return
-		}
-		c.Redirect(http.StatusSeeOther, safeReturn(ch.ReturnTo))
-		return
-	}
-	// step-up of the current session
-	if err := s.upgradeSession(c); err != nil {
-		s.fail(c, err)
-		return
-	}
-	c.Redirect(http.StatusSeeOther, safeReturn(ch.ReturnTo))
 }
 
 // upgradeSession adds the otp method to the current session.

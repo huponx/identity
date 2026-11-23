@@ -30,7 +30,8 @@ What happens when a user calls an auth API or a normal API through the gatekeepe
 | `POST /oauth2/token` | grants `authorization_code`, `refresh_token` (rotation + reuse detection), `client_credentials`, `urn:ietf:params:oauth:grant-type:token-exchange` |
 | `POST /oauth2/revoke`, `POST /oauth2/introspect`, `/userinfo` | RFC 7009, RFC 7662, OIDC |
 | `/oauth2/logout` | RP-initiated logout and back-channel logout to the clients |
-| `/login`, `/login/mfa`, `/password/forgot`, `/password/reset`, `/account/mfa` | pages (CSRF token, `__Host-` cookies, security headers) |
+| `/login`, `/login/mfa`, `/password/forgot`, `/password/reset`, `/account/mfa`, `/logout` | the sign in app (React, `web/apps/auth`, copied into the image at `/ui`, `IDENTITY_UI_DIR`) |
+| `/auth-api/*` | JSON API of that app (CSRF token in the body, `__Host-` cookies, security headers) |
 
 ## Tokens
 
@@ -54,6 +55,8 @@ Permissions are colon separated segments with segment wildcards: `*` alone match
 | `IDENTITY_MFA_ISSUER_NAME` | `Example` | label in authenticator apps |
 | `IDENTITY_AUTH_AUDIENCE` | `identity` | `aud` accepted by the gRPC API |
 | `IDENTITY_TRUSTED_PROXIES` | empty | CIDRs of the ingress, for the client IP of the rate limits |
+| `IDENTITY_APPS` | empty | `Name=https://url` or `Name=https://url|https://icon` entries, comma separated: the applications of `/apps` (the icon is optional; its origin is added to the `img-src` of the CSP), where a user lands after signing in at identity itself (no `return_to`) |
+| `IDENTITY_UI_DIR` | `/ui` | build of the sign in app (`web/apps/auth`; the image carries it). Required unless `ENV=local`, where the page paths answer 503 without it |
 | `COURIER_TARGET`, `COURIER_TOKEN_FILE` | empty | e-mails; empty disables them (links are logged when `ENV=local`) |
 | `POSTGRES_*`, `REDIS_*`, `HOST`, `ENV`, `LOG_*` | | gocommon blocks |
 

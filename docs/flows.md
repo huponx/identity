@@ -39,14 +39,30 @@ Two listeners run in one process:
 | `POST /oauth2/revoke` | `revoke` (`tokens.go`) |
 | `POST /oauth2/introspect` | `introspect` (`tokens.go`) |
 | `GET, POST /userinfo` | `userinfo` (`tokens.go`) |
-| `GET, POST /oauth2/logout` | `endSession` (`pages.go`) |
-| `GET, POST /login` | `loginForm`, `loginSubmit` (`authorize.go`) |
-| `GET, POST /login/mfa` | `mfaForm`, `mfaSubmit` (`authorize.go`) |
-| `GET, POST /login/password` | `passwordChangeForm`, `passwordChangeSubmit` (`pages.go`): forced change of a temporary password |
-| `GET, POST /password/forgot` | `forgotForm`, `forgotSubmit` (`pages.go`) |
-| `GET, POST /password/reset` | `resetForm`, `resetSubmit` (`pages.go`) |
-| `GET, POST /account/mfa` | `accountMFA`, `accountMFAConfirm` (`pages.go`) |
-| `POST /account/mfa/disable` | `accountMFADisable` (`pages.go`) |
+| `GET, POST /oauth2/logout` | `endSession` (`logout.go`) |
+| `GET /login`, `/login/mfa`, `/login/password`, `/password/forgot`, `/password/reset`, `/account/mfa`, `/logout`, `/error` | `spa` (`server.go`): `index.html` of the sign in app (`IDENTITY_UI_DIR`); the app routes itself |
+| `GET /assets/*`, `/logo.svg`, `/theme-init.js` | files of the sign in app (`pages` in `server.go`) |
+| `GET /auth-api/csrf` | `csrfToken`: sets the `csrf` cookie, returns the token |
+| `POST /auth-api/login` | `apiLogin` (`authapi.go`) |
+| `GET, POST /auth-api/login/mfa` | `apiMFACheck`, `apiMFA` |
+| `GET, POST /auth-api/login/password` | `apiPasswordChangeCheck`, `apiPasswordChange`: forced change of a temporary password |
+| `POST /auth-api/password/forgot` | `apiForgot` |
+| `GET, POST /auth-api/password/reset` | `apiResetCheck`, `apiReset` |
+| `GET, POST /auth-api/account/mfa`, `POST /auth-api/account/mfa/disable` | `apiAccountMFA`, `apiAccountMFAConfirm`, `apiAccountMFADisable` |
+| `GET /auth-api/apps` | `apiApps`: the applications of `IDENTITY_APPS`, for the signed in user |
+| `POST /auth-api/logout` | `apiLogout`: sign out of the confirmation page of `/logout` |
+
+A sign in without a valid `return_to` (the user typed `/login`) ends at `/apps`, the list of the configured applications
+with a link to the MFA page; it is not an MFA step. MFA enrollment comes only when the account must have it (mode `required`
+or enforced for the user), and then continues to `/apps`.
+
+The sign in pages are a React app (`web/apps/auth`, image `auth-ui`), copied into the identity image at `/ui` and served
+from the same origin, so cookies, CSRF and CSP need no cross origin rules. The JSON API answers `{"redirect": "<path>"}`
+(the next step; the app only follows paths, and a full URL only after a sign out) or `{"code", "message"}` with the
+status of the error; every POST carries the `csrf` token of the cookie in its body and passes the Origin check.
+Without `IDENTITY_UI_DIR/index.html` the service refuses to start (`ENV` other than `local`) or answers 503 on the page
+paths. Authorize errors that cannot go back to the client redirect to `/error?e=<code>` (a fixed code, nothing of the
+request is shown).
 
 Every response goes through `securityHeaders` (no-store, CSP, no referrer) and `limitBody`
 (64 KiB) from `server.go`.
@@ -141,7 +157,7 @@ sequenceDiagram
     I->>P: ClientByID
     alt no valid SSO session
         I-->>B: 302 /login?return_to=/oauth2/authorize?...
-        B->>I: POST /login (email, password, csrf)
+        B->>I: POST /auth-api/login (email, password, csrf)
         I->>P: UserByEmail, verify argon2id
         I->>R: rate limit, create session
         I-->>B: 302 return_to + Set-Cookie sid
@@ -206,9 +222,9 @@ Steps in the function, in order:
    scope, nonce, PKCE challenge, auth time, `amr`, `acr` and session id. Redirect with
    `code`, `state` and `iss` (RFC 9207).
 
-### 4.2 Login — `loginForm`, `loginSubmit` (`authorize.go`)
+### 4.2 Login — `apiLogin` (`authapi.go`)
 
-`loginSubmit`:
+`apiLogin`:
 
 1. `csrfOK` (double submit cookie plus `Origin` check, `server.go`).
 2. `account.PasswordLogin` (`internal/account/account.go`):
@@ -241,22 +257,22 @@ sequenceDiagram
     participant R as Redis
     participant P as Postgres
 
-    B->>I: POST /login (email, password, csrf)
+    B->>I: POST /auth-api/login (email, password, csrf)
     I->>R: Allow login:ip, login:email
     I->>P: UserByEmail, argon2id verify
     I->>R: SaveChallenge amr=[pwd] (5 min), no session yet
     I-->>B: 303 /login/mfa?c=id
-    B->>I: POST /login/mfa (code, csrf)
+    B->>I: POST /auth-api/login/mfa (c, code, csrf)
     I->>R: Attempt(id, 5), Allow mfa:user
     I->>P: open factor, match TOTP, AdvanceMFAStep
     I->>R: DeleteChallenge, CreateSession amr=[pwd, otp]
     I-->>B: 303 return_to + Set-Cookie sid
 ```
 
-### 4.3 Second factor at login — `mfaForm`, `mfaSubmit`
+### 4.3 Second factor at login — `apiMFACheck`, `apiMFA`
 
 1. `state.PeekChallenge` to show the form (no attempt counted).
-2. `mfaSubmit`: `csrfOK`, then `state.Attempt(id, 5)`: counts atomically, and after 5 tries
+2. `apiMFA`: `csrfOK`, then `state.Attempt(id, 5)`: counts atomically, and after 5 tries
    deletes the challenge (the user must enter the password again).
 3. A second limit of 15 attempts per 10 minutes per user (`state.Allow` `mfa:user:<id>`).
 4. `account.VerifySecondFactor` (see section 8.3).
@@ -264,14 +280,14 @@ sequenceDiagram
    with `amr=[pwd, otp]`. Otherwise it was a step-up: `upgradeSession` adds `otp` to the
    existing session (`state.UpdateSession`, TTL kept). Then redirect to `safeReturn(ReturnTo)`.
 
-### 4.4 Forced password change — `passwordChangeForm`, `passwordChangeSubmit` (`pages.go`)
+### 4.4 Forced password change — `apiPasswordChangeCheck`, `apiPasswordChange` (`authapi.go`)
 
 For a user with `must_change_password` (the admin made by the setup Job). The password the user typed is
 temporary: somebody else knows it, so no session, MFA step or authorization code exists until it is replaced.
 
-1. `passwordChangeForm`: `state.PeekChallenge` must exist and have `Purpose == password` (a second factor
+1. `apiPasswordChangeCheck`: `state.PeekChallenge` must exist and have `Purpose == password` (a second factor
    challenge is not accepted here, and a password challenge is refused by `/login/mfa`).
-2. `passwordChangeSubmit`: `csrfOK`, then `state.Attempt(id, 10)`. The user must still exist, be enabled and have
+2. `apiPasswordChange`: `csrfOK`, then `state.Attempt(id, 10)`. The user must still exist, be enabled and have
    the flag. The two fields must be equal.
 3. `account.SetPassword(user, new, check=true)`: `password.Check` (policy, not the e-mail, not the same as the
    old one), `store.SetUserPassword` (which also clears `must_change_password`), `RevokeUserAccess`, mail
@@ -286,11 +302,11 @@ sequenceDiagram
     participant R as Redis
     participant P as Postgres
 
-    B->>I: POST /login (email, temporary password)
+    B->>I: POST /auth-api/login (email, temporary password)
     I->>P: UserByEmail, argon2id verify
     I->>R: SaveChallenge purpose=password (5 min), no session
     I-->>B: 303 /login/password?c=id
-    B->>I: POST /login/password (new password twice, csrf)
+    B->>I: POST /auth-api/login/password (new password twice, csrf)
     I->>R: Attempt(id, 10)
     I->>P: SetUserPassword (clears must_change_password)
     I->>R: DeleteChallenge, then MFA step or CreateSession
@@ -518,7 +534,7 @@ sequenceDiagram
     I-)A: POST logout_token (background, 3 tries)
 ```
 
-### 7.1 RP initiated logout — `endSession` (`pages.go`)
+### 7.1 RP initiated logout — `endSession` (`logout.go`)
 
 `GET` or `POST /oauth2/logout`.
 
@@ -571,7 +587,7 @@ sequenceDiagram
     participant P as Postgres
     participant C as courier
 
-    U->>I: POST /password/forgot (email)
+    U->>I: POST /auth-api/password/forgot (email)
     I->>I: rate limit (IP 10/h, e-mail 3/h)
     I->>P: UserByEmail
     I->>P: CreatePasswordReset(digest(token), 30 min)
@@ -579,18 +595,18 @@ sequenceDiagram
     I-)C: SendNotification (background)
     U->>I: GET /password/reset?token
     I->>P: PeekPasswordReset
-    U->>I: POST /password/reset (token, new password)
+    U->>I: POST /auth-api/password/reset (token, new password)
     I->>P: ConsumePasswordReset (atomic)
     I->>P: SetUserPassword
     I->>I: RevokeUserAccess
 ```
 
-- `forgotSubmit` calls `account.RequestReset`: rate limits per IP and per e-mail (over the limit
+- `apiForgot` calls `account.RequestReset`: rate limits per IP and per e-mail (over the limit
   it still answers the same), unknown or disabled users return `nil`, so the answer never
   reveals whether the address exists. The mail is sent in the background (`Service.background`) so the
   response time does not depend on the outcome.
-- `resetForm` calls `account.ResetTokenUser` (peek only).
-- `resetSubmit` calls `account.CompleteReset`: the password policy (`password.Check`: length,
+- `apiResetCheck` calls `account.ResetTokenUser` (peek only).
+- `apiReset` calls `account.CompleteReset`: the password policy (`password.Check`: length,
   common passwords, not the e-mail, not the same) runs before the token is consumed;
   `store.ConsumePasswordReset` is atomic, so two requests with one token cannot both win; then
   `SetPassword` stores the hash, calls `RevokeUserAccess` and mails "password changed".
@@ -627,7 +643,7 @@ sequenceDiagram
     B->>I: GET /account/mfa (session)
     I->>P: ReplaceMFAFactor (sealed secret, unconfirmed)
     I-->>B: QR code and key
-    B->>I: POST /account/mfa (code)
+    B->>I: POST /auth-api/account/mfa (code)
     I->>P: match TOTP, ConfirmMFAFactor, 10 recovery code digests
     I->>I: upgradeSession (add otp)
     I-->>B: recovery codes (shown once)
@@ -687,14 +703,28 @@ anything else → Internal without details).
 | `SetUserDisabled` | `identity:user:write` | disabling also calls `RevokeUserAccess` |
 | `SetUserPassword` | `identity:user:write` | `account.SetPassword(check=true)` |
 | `SendPasswordReset` | `identity:user:write` | `account.SendReset` |
+| `UpdateUser` | `identity:user:write` | name, locale (`en`, `vi`) and theme (`light`, `dark`, `system`; `identity_users.theme`, V12) |
+| `SetUserAvatar` | `identity:user:write` | png/jpeg/webp, at most 64 KiB and 512x512, stored as `bytea`; `GetUser` returns it as a data URI |
+| `ListPermissions` | `identity:permission:read` | the catalog of permissions, with how many roles hold each; paged by token (see below) |
+| `CreatePermission`, `UpdatePermission`, `DeletePermission` | `identity:permission:write` | roles can only hold catalog permissions (FK `identity_role_permissions_permission_fkey`); a permission held by a role cannot be deleted |
+| `GetUserStats` | `identity:user:read` | counts by status, plus `created_this_month` (UTC) (active/pending/disabled), MFA, avatar, activity |
+| `GetMe`, `UpdateMe`, `SetMyAvatar` | any user token (`grpcserver.Public`) | the user is the token subject (`meID`), never a request field; service tokens are refused; `UpdateMe` keeps empty fields |
+| `SendWelcome` | `identity:user:write` | `account.SendWelcome`: set-password link valid 7 days, only while the user has no password |
 | `CreateRole`, `SetRolePermissions`, `AssignRole`, `RevokeRole` | `identity:role:write` | `authz.Valid` on each permission; roles go to a user **or** a client |
-| `ListRoles` | `identity:role:read` | |
+| `UpdateRole` | `identity:role:write` | replaces description and permissions of a role in one transaction |
+| `DeleteRole` | `identity:role:write` | refused (`FAILED_PRECONDITION`) while a user or a client holds the role; the role row is locked while counting |
+| `ListRoles` | `identity:role:read` | each role has `assigned_count` (users + clients); paged by token (see below) |
 | `CreateClient`, `RotateClientSecret` | `identity:client:write` | validates grants and URIs; a public client cannot use `client_credentials` or exchange; the secret is returned once |
-| `ListClients` | `identity:client:read` | |
+| `UpdateClient` | `identity:client:write` | replaces name, URIs, grants, scopes, resource and roles; the id and type are fixed, the grant rules of the stored type apply |
+| `SetClientDisabled` | `identity:client:write` | a disabled client cannot start a sign in or get tokens; the client of the caller's own session cannot be disabled |
+| `DeleteClient` | `identity:client:write` | only a disabled client, never the client of the caller's own session; roles and exchange policies cascade |
+| `ListClients` | `identity:client:read` | each client has `disabled`; paged by token (see below) |
 | `SetExchangePolicy` | `identity:exchange:write` | `max_chain_depth` 1 to 5; `delete` removes the policy |
-| `ListExchangePolicies` | `identity:exchange:read` | |
+| `ListExchangePolicies` | `identity:exchange:read` | filters `client_id` (exact), `query` (client, audience or scope contains) and `audience` (contains), case insensitive, combined with AND; paged by token (see below) |
 | `GetUserMFA` | `identity:mfa:read` | |
 | `SetUserMFA`, `EnforceUserMFA`, `ResetUserMFA` | `identity:mfa:write` | Admin methods of `account` (turn off, enforce, reset and end sessions) |
+
+Pagination: `ListUsers`, `ListRoles`, `ListPermissions`, `ListClients` and `ListExchangePolicies` take `page_size` (default 50, at most 200) and `page_token`, and answer `next_page_token` (empty on the last page). The token is opaque (base64url of the sort key of the last item: email, role name, permission name, client id, or client id and audience) and the query is keyset (`key > last`), not offset, so pages stay stable while rows are added or removed. An invalid token is `InvalidArgument`. The admin pages show 25 per page with a Load more button; the pickers (role cards, permission picker, client suggestions) read every page.
 
 Note: there is no RPC to add a redirect URI to a client. That is only the setup Job (`redirect_uris` and `post_logout_uris` in `SETUP_CONFIG`, merged into the stored lists).
 
@@ -956,7 +986,7 @@ add an upstream, routes and an exchange policy (an exchange policy `gatekeeper -
 | PKCE S256 required | `authorize`, `pkceOK` |
 | Code works once, 60 s | `state.TakeCode` (GETDEL), `codeTTL` |
 | CSRF on forms | `csrfOK`: double submit cookie + `Origin` |
-| No session fixation | `loginSubmit` ends the old session |
+| No session fixation | `apiLogin` ends the old session |
 | No user enumeration | `DummyVerify`, same message, `RequestReset` answers the same |
 | Brute force limits | `state.Allow` (login, reset, MFA confirm, MFA disable, MFA user), `state.Attempt` (5 per challenge) |
 | TOTP replay | `store.AdvanceMFAStep` |

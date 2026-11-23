@@ -3,7 +3,7 @@ BIN ?= bin
 IMAGE_TAG  ?= dev
 IMAGE_REPO ?= ghcr.io/huponx
 
-.PHONY: help tidy test vet build run e2e docker clean
+.PHONY: help tidy test vet build run e2e check-auth-ui docker clean
 
 help:
 	@printf '%s\n' \
@@ -13,6 +13,7 @@ help:
 		'build   identity and identity-setup into $(BIN)/' \
 		'run     go run ./cmd/identity (reads the environment, see .env.example)' \
 		'e2e     scripts/e2e.sh: code+PKCE, refresh reuse, token exchange against local Postgres/Redis' \
+		'check-auth-ui  check that the auth-ui image tag of the Dockerfile exists' \
 		'docker  build the image'
 
 tidy:
@@ -34,6 +35,9 @@ run:
 
 e2e:
 	scripts/e2e.sh
+
+check-auth-ui:
+	scripts/check-auth-ui.sh
 
 docker:
 	docker build -f build/identity/Dockerfile -t $(IMAGE_REPO)/identity:$(IMAGE_TAG) .

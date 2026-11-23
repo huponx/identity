@@ -2,6 +2,13 @@
 # Build context is the repository root:
 #   docker build -f build/identity/Dockerfile -t identity:dev .
 ARG GO_VERSION=1.26
+# The sign in pages (login, MFA, password reset, account MFA) are a React app of the web repository, published
+# as the image auth-ui. Its files are copied into /ui, where identity serves them (IDENTITY_UI_DIR). The tag is
+# the version of the pages this release carries: bump it after a new release of the web repository (scripts/check-auth-ui.sh
+# fails a PR whose tag does not exist). The placeholder tag below does not exist on purpose: set it to a published one.
+ARG AUTH_UI_IMAGE=ghcr.io/huponx/auth-ui:v2026.11.2-release-4aef3da
+
+FROM ${AUTH_UI_IMAGE} AS ui
 
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION} AS build
 WORKDIR /src
@@ -24,6 +31,7 @@ LABEL org.opencontainers.image.title="identity" \
       org.opencontainers.image.revision="${REVISION}"
 COPY --from=build /out/identity /identity
 COPY --from=build /out/identity-setup /identity-setup
+COPY --from=ui /usr/share/nginx/html /ui
 EXPOSE 9090 8080
 USER nonroot:nonroot
 ENTRYPOINT ["/identity"]

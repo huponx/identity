@@ -21,6 +21,8 @@ type User struct {
 type Notifier interface {
 	PasswordReset(ctx context.Context, u User, link string, expiresIn time.Duration, resetID string) error
 	PasswordChanged(ctx context.Context, u User, eventID string) error
+	// Welcome tells a new user to set the first password with link, valid for expiresIn.
+	Welcome(ctx context.Context, u User, link string, expiresIn time.Duration, tokenID string) error
 	// MFAChanged tells the user that MFA was turned on, off, enforced or reset; change is one of
 	// "enabled", "disabled", "enforced", "reset".
 	MFAChanged(ctx context.Context, u User, change, eventID string) error
@@ -56,6 +58,13 @@ func (c *Courier) PasswordReset(ctx context.Context, u User, link string, expire
 	})
 }
 
+// Welcome implements Notifier. expires_in is in days.
+func (c *Courier) Welcome(ctx context.Context, u User, link string, expiresIn time.Duration, tokenID string) error {
+	return c.send(ctx, u, "identity_welcome", "identity-welcome-"+tokenID, map[string]string{
+		"link": link, "expires_in": fmt.Sprintf("%d", int(expiresIn.Hours()/24)),
+	})
+}
+
 // PasswordChanged implements Notifier.
 func (c *Courier) PasswordChanged(ctx context.Context, u User, eventID string) error {
 	return c.send(ctx, u, "identity_password_changed", "identity-password-changed-"+eventID, map[string]string{})
@@ -73,6 +82,12 @@ type Log struct{ Logger *zap.Logger }
 // PasswordReset implements Notifier.
 func (l Log) PasswordReset(_ context.Context, u User, link string, _ time.Duration, _ string) error {
 	l.Logger.Info("password reset mail (local, not sent)", zap.String("to", u.Email), zap.String("link", link))
+	return nil
+}
+
+// Welcome implements Notifier.
+func (l Log) Welcome(_ context.Context, u User, link string, _ time.Duration, _ string) error {
+	l.Logger.Info("welcome mail (local, not sent)", zap.String("to", u.Email), zap.String("link", link))
 	return nil
 }
 
@@ -94,6 +109,12 @@ type None struct{ Logger *zap.Logger }
 // PasswordReset implements Notifier.
 func (n None) PasswordReset(_ context.Context, _ User, _ string, _ time.Duration, _ string) error {
 	n.Logger.Warn("courier is not configured: password reset mail dropped")
+	return nil
+}
+
+// Welcome implements Notifier.
+func (n None) Welcome(_ context.Context, _ User, _ string, _ time.Duration, _ string) error {
+	n.Logger.Warn("courier is not configured: welcome mail dropped")
 	return nil
 }
 
