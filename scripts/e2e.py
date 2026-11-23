@@ -25,14 +25,19 @@ jar = http.cookiejar.CookieJar()
 opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar), NoRedirect)
 
 
-def call(method, url, data=None, headers=None):
+def call(method, url, data=None, headers=None, raw=None):
     req = urllib.request.Request(url, method=method, headers=headers or {},
-                                 data=urllib.parse.urlencode(data).encode() if data is not None else None)
+                                 data=raw if raw is not None else
+                                 urllib.parse.urlencode(data).encode() if data is not None else None)
     try:
         r = opener.open(req)
     except urllib.error.HTTPError as e:
         r = e
     return r.status, dict(r.headers), r.read().decode()
+
+
+def call_json(method, url, data):
+    return call(method, url, None, {"Content-Type": "application/json", "Origin": ISS}, json.dumps(data).encode())
 
 
 def check(name, cond, extra=""):
@@ -70,15 +75,17 @@ check("authorize without PKCE is refused", s in (302, 400) and "code=" not in h.
 
 s, h, b = call("GET", f"{ISS}/oauth2/authorize?{q}")
 check("authorize redirects to login", s == 302 and "/login" in h["Location"], (s, h))
-s, h, b = call("GET", ISS + h["Location"] if h["Location"].startswith("/") else h["Location"])
-csrf = re.search(r'name="csrf" value="([^"]+)"', b).group(1)
-ret = re.search(r'name="return_to" value="([^"]*)"', b).group(1).replace("&amp;", "&").replace("&#43;", "+")
+ret = urllib.parse.parse_qs(urllib.parse.urlparse(h["Location"]).query)["return_to"][0]
+# the sign in page is the app of the web repository; its calls are the JSON API (same origin, CSRF token + cookie)
+s, h, b = call("GET", f"{ISS}/auth-api/csrf")
+check("csrf token", s == 200, (s, b))
+csrf = json.loads(b)["csrf"]
 
-s, h, b = call("POST", f"{ISS}/login", {"csrf": csrf, "return_to": ret, "email": EMAIL, "password": "wrong-password-xx"})
-check("wrong password is refused", s in (200, 401), s)
-s, h, b = call("POST", f"{ISS}/login", {"csrf": csrf, "return_to": ret, "email": EMAIL, "password": PASSWORD})
-check("login ok -> redirect", s == 303 or s == 302, (s, b[:200]))
-loc = h["Location"]
+s, h, b = call_json("POST", f"{ISS}/auth-api/login", {"csrf": csrf, "return_to": ret, "email": EMAIL, "password": "wrong-password-xx"})
+check("wrong password is refused", s == 401 and json.loads(b)["code"] == "invalid_credentials", (s, b))
+s, h, b = call_json("POST", f"{ISS}/auth-api/login", {"csrf": csrf, "return_to": ret, "email": EMAIL, "password": PASSWORD})
+check("login ok -> redirect", s == 200 and "redirect" in json.loads(b), (s, b[:200]))
+loc = json.loads(b)["redirect"]
 s, h, b = call("GET", ISS + loc if loc.startswith("/") else loc)
 check("authorize returns the code", s == 302 and h["Location"].startswith(REDIRECT), (s, h))
 cb = urllib.parse.urlparse(h["Location"])

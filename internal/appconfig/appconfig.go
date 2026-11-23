@@ -2,6 +2,7 @@ package appconfig
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -68,6 +69,69 @@ type Identity struct {
 	// (the ingress controller). Empty: the connection address is used, which is safe but makes the
 	// per-IP rate limits count the ingress as one client.
 	TrustedProxies []string `env:"IDENTITY_TRUSTED_PROXIES" envSeparator:","`
+
+	// UIDir holds the built sign in app (index.html and assets/); the image has it in /ui. Outside ENV=local
+	// the service does not start without it; locally the page paths answer 503 and a warning is logged.
+	UIDir string `env:"IDENTITY_UI_DIR" envDefault:"/ui"`
+
+	// Apps are the applications listed on /apps, the page a user lands on after signing in at identity itself
+	// (no application sent them): "Name=https://url" entries, comma separated, each with an optional icon
+	// "Name=https://url|https://icon.example/logo.svg".
+	Apps []string `env:"IDENTITY_APPS" envSeparator:","`
+}
+
+// AppLink is an application of the /apps page.
+type AppLink struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+	Icon string `json:"icon,omitempty"`
+}
+
+// IconOrigins are the origins the sign in pages may load the icons from (the img-src of the CSP).
+func IconOrigins(apps []AppLink) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, a := range apps {
+		if a.Icon == "" {
+			continue
+		}
+		u, err := url.Parse(a.Icon)
+		if err != nil {
+			continue
+		}
+		if o := u.Scheme + "://" + u.Host; !seen[o] {
+			seen[o] = true
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
+func (c Identity) okURL(u string) bool {
+	p, err := url.Parse(u)
+	if err != nil || p.Host == "" {
+		return false
+	}
+	return p.Scheme == "https" || (c.IsLocal() && p.Scheme == "http")
+}
+
+// AppLinks parses IDENTITY_APPS.
+func (c Identity) AppLinks() ([]AppLink, error) {
+	var out []AppLink
+	for _, e := range c.Apps {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		name, u, ok := strings.Cut(e, "=")
+		u, icon, _ := strings.Cut(u, "|")
+		name, u, icon = strings.TrimSpace(name), strings.TrimSpace(u), strings.TrimSpace(icon)
+		if !ok || name == "" || !c.okURL(u) || (icon != "" && !c.okURL(icon)) {
+			return nil, fmt.Errorf("IDENTITY_APPS entries are Name=https://url or Name=https://url|https://icon (http only with ENV=local), got %q", e)
+		}
+		out = append(out, AppLink{Name: name, URL: u, Icon: icon})
+	}
+	return out, nil
 }
 
 // Setup is the configuration of identity-setup (the initial setup Job): only the database.
@@ -99,6 +163,9 @@ func (c Identity) Validate() error {
 	}
 	if !c.IsLocal() && !strings.HasPrefix(c.Issuer, "https://") {
 		return fmt.Errorf("IDENTITY_ISSUER must be https outside ENV=local")
+	}
+	if _, err := c.AppLinks(); err != nil {
+		return err
 	}
 	if c.SessionAbsoluteTTL < c.SessionIdleTTL {
 		return fmt.Errorf("IDENTITY_SESSION_ABSOLUTE_TTL must not be shorter than IDENTITY_SESSION_IDLE_TTL")

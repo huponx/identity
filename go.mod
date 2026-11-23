@@ -13,6 +13,7 @@ require (
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	go.uber.org/zap v1.28.0
 	golang.org/x/crypto v0.59.0
+	golang.org/x/image v0.48.0
 	google.golang.org/grpc v1.85.0
 )
 

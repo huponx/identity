@@ -20,6 +20,14 @@ import (
 var (
 	ErrNotFound = errors.New("store: not found")
 	ErrConflict = errors.New("store: already exists")
+	// ErrUnknownPermission: a role was given a permission that is not in the catalog.
+	ErrUnknownPermission = errors.New("store: permission is not in the catalog")
+	// ErrPermissionInUse: the permission is held by a role and cannot be deleted.
+	ErrPermissionInUse = errors.New("store: permission is held by a role")
+	// ErrRoleInUse: the role is held by a user or a client and cannot be deleted.
+	ErrRoleInUse = errors.New("store: role is held by a user or a client")
+	// ErrClientNotDisabled: only a disabled client can be deleted.
+	ErrClientNotDisabled = errors.New("store: client is not disabled")
 )
 
 // Store wraps the pool.
@@ -59,6 +67,9 @@ func mapErr(err error) error {
 		case "23505": // unique_violation
 			return ErrConflict
 		case "23503": // foreign_key_violation: the referenced row does not exist
+			if pg.ConstraintName == "identity_role_permissions_permission_fkey" {
+				return ErrUnknownPermission
+			}
 			return ErrNotFound
 		}
 	}
@@ -81,13 +92,16 @@ type User struct {
 	// MustChangePassword: the password was set by somebody else (setup Job); the user must choose their own at the next sign in.
 	MustChangePassword bool
 	CreatedAt          time.Time
+	HasAvatar          bool       // the picture itself is read with UserAvatar
+	LastLoginAt        *time.Time // nil: never signed in (or before sign ins were tracked)
+	Theme              string     // light, dark or system; "" until the user chose one
 }
 
-const userCols = `id::text, email, name, locale, coalesce(password_hash, ''), password_changed_at, disabled, mfa_enabled, mfa_enforced, must_change_password, created_at`
+const userCols = `id::text, email, name, locale, coalesce(password_hash, ''), password_changed_at, disabled, mfa_enabled, mfa_enforced, must_change_password, created_at, avatar IS NOT NULL, last_login_at, coalesce(theme, '')`
 
 func scanUser(row pgx.Row) (*User, error) {
 	var u User
-	err := row.Scan(&u.ID, &u.Email, &u.Name, &u.Locale, &u.PasswordHash, &u.PasswordChangedAt, &u.Disabled, &u.MFAEnabled, &u.MFAEnforced, &u.MustChangePassword, &u.CreatedAt)
+	err := row.Scan(&u.ID, &u.Email, &u.Name, &u.Locale, &u.PasswordHash, &u.PasswordChangedAt, &u.Disabled, &u.MFAEnabled, &u.MFAEnforced, &u.MustChangePassword, &u.CreatedAt, &u.HasAvatar, &u.LastLoginAt, &u.Theme)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -157,6 +171,40 @@ func (s *Store) execUser(ctx context.Context, id, sql string, args ...any) error
 // SetUserDisabled enables or disables the account.
 func (s *Store) SetUserDisabled(ctx context.Context, id string, disabled bool) error {
 	return s.execUser(ctx, id, `UPDATE identity_users SET disabled = $2, updated_at = now() WHERE id = $1`, disabled)
+}
+
+// UpdateUser changes the name and, when locale is not empty, the locale.
+func (s *Store) UpdateUser(ctx context.Context, id, name, locale string) error {
+	return s.execUser(ctx, id, `UPDATE identity_users SET name = $2, locale = coalesce(nullif($3, ''), locale), updated_at = now() WHERE id = $1`, name, locale)
+}
+
+// SetUserTheme stores the theme the user chose (light, dark or system; the caller validates it).
+func (s *Store) SetUserTheme(ctx context.Context, id, theme string) error {
+	return s.execUser(ctx, id, `UPDATE identity_users SET theme = $2, updated_at = now() WHERE id = $1`, theme)
+}
+
+// SetUserAvatar stores the encoded picture; an empty image removes it.
+func (s *Store) SetUserAvatar(ctx context.Context, id string, image []byte, mime string) error {
+	if len(image) == 0 {
+		return s.execUser(ctx, id, `UPDATE identity_users SET avatar = NULL, avatar_mime = NULL, updated_at = now() WHERE id = $1`)
+	}
+	return s.execUser(ctx, id, `UPDATE identity_users SET avatar = $2, avatar_mime = $3, updated_at = now() WHERE id = $1`, image, mime)
+}
+
+// UserAvatar returns the picture and its media type; ErrNotFound when the user has none.
+func (s *Store) UserAvatar(ctx context.Context, id string) ([]byte, string, error) {
+	if _, err := uuid.Parse(id); err != nil {
+		return nil, "", ErrNotFound
+	}
+	var img []byte
+	var mime *string
+	if err := s.pool.QueryRow(ctx, `SELECT avatar, avatar_mime FROM identity_users WHERE id = $1`, id).Scan(&img, &mime); err != nil {
+		return nil, "", mapErr(err)
+	}
+	if img == nil || mime == nil {
+		return nil, "", ErrNotFound
+	}
+	return img, *mime, nil
 }
 
 // SetUserPassword stores a new password hash.
@@ -317,9 +365,22 @@ func (s *Store) ClientByID(ctx context.Context, id string) (*Client, error) {
 	return scanClient(s.pool.QueryRow(ctx, `SELECT `+clientCols+` FROM identity_clients WHERE client_id = $1`, id))
 }
 
-// ListClients returns every client.
-func (s *Store) ListClients(ctx context.Context) ([]Client, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+clientCols+` FROM identity_clients ORDER BY client_id`)
+// ListClients returns the clients; a query keeps those whose id, name or type contains it (case insensitive) or
+// that have a grant or a role containing it; clientType ("public" or "confidential", empty for both) narrows further.
+// Up to limit+1 clients come back, ordered by id and starting after the id `after` ("" for the first page), so the
+// caller can tell whether another page exists.
+func (s *Store) ListClients(ctx context.Context, query, clientType, after string, limit int) ([]Client, error) {
+	like := ""
+	if query != "" {
+		like = likeContains(query)
+	}
+	rows, err := s.pool.Query(ctx, `SELECT `+clientCols+` FROM identity_clients
+		WHERE ($1 = '' OR client_id ILIKE $1 OR name ILIKE $1 OR type ILIKE $1
+		   OR EXISTS (SELECT 1 FROM unnest(allowed_grants) g WHERE g ILIKE $1)
+		   OR EXISTS (SELECT 1 FROM identity_client_roles cr WHERE cr.client_id = identity_clients.client_id AND cr.role ILIKE $1))
+		  AND ($2 = '' OR type = $2)
+		  AND client_id > $3
+		ORDER BY client_id LIMIT $4`, like, clientType, after, limit+1)
 	if err != nil {
 		return nil, err
 	}
@@ -333,6 +394,70 @@ func (s *Store) ListClients(ctx context.Context) ([]Client, error) {
 		out = append(out, *c)
 	}
 	return out, rows.Err()
+}
+
+// UpdateClient replaces everything of a client but its id, type and secret, roles included.
+func (s *Store) UpdateClient(ctx context.Context, c Client) (*Client, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	tag, err := tx.Exec(ctx, `UPDATE identity_clients SET name = $2, redirect_uris = $3, post_logout_redirect_uris = $4,
+		backchannel_logout_uri = $5, allowed_grants = $6, allowed_scopes = $7, resource = $8, updated_at = now() WHERE client_id = $1`,
+		c.ClientID, c.Name, nz(c.RedirectURIs), nz(c.PostLogoutRedirectURIs), c.BackchannelLogoutURI, nz(c.AllowedGrants), nz(c.AllowedScopes), c.Resource)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, ErrNotFound
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM identity_client_roles WHERE client_id = $1`, c.ClientID); err != nil {
+		return nil, err
+	}
+	for _, r := range c.Roles {
+		if _, err := tx.Exec(ctx, `INSERT INTO identity_client_roles (client_id, role) VALUES ($1, $2) ON CONFLICT DO NOTHING`, c.ClientID, r); err != nil {
+			return nil, mapErr(err)
+		}
+	}
+	out, err := scanClient(tx.QueryRow(ctx, `SELECT `+clientCols+` FROM identity_clients WHERE client_id = $1`, c.ClientID))
+	if err != nil {
+		return nil, err
+	}
+	return out, tx.Commit(ctx)
+}
+
+// SetClientDisabled disables or enables a client.
+func (s *Store) SetClientDisabled(ctx context.Context, id string, disabled bool) (*Client, error) {
+	tag, err := s.pool.Exec(ctx, `UPDATE identity_clients SET disabled = $2, updated_at = now() WHERE client_id = $1`, id, disabled)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, ErrNotFound
+	}
+	return s.ClientByID(ctx, id)
+}
+
+// DeleteClient removes a disabled client; its roles and exchange policies cascade. The row is locked while
+// the flag is read, so a concurrent enable cannot slip in.
+func (s *Store) DeleteClient(ctx context.Context, id string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var disabled bool
+	if err := tx.QueryRow(ctx, `SELECT disabled FROM identity_clients WHERE client_id = $1 FOR UPDATE`, id).Scan(&disabled); err != nil {
+		return mapErr(err)
+	}
+	if !disabled {
+		return ErrClientNotDisabled
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM identity_clients WHERE client_id = $1`, id); err != nil {
+		return mapErr(err)
+	}
+	return tx.Commit(ctx)
 }
 
 // SetClientSecret replaces the secret hash of a confidential client.
@@ -375,6 +500,8 @@ type Role struct {
 	Name        string
 	Description string
 	Permissions []string
+	// AssignedCount is how many users and clients hold the role (read by ListRoles and RoleByName).
+	AssignedCount int64
 }
 
 // CreateRole inserts a role and its permissions.
@@ -417,10 +544,59 @@ func (s *Store) SetRolePermissions(ctx context.Context, role string, perms []str
 	return tx.Commit(ctx)
 }
 
+// UpdateRole replaces the description and the permissions of a role.
+func (s *Store) UpdateRole(ctx context.Context, name, description string, perms []string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	tag, err := tx.Exec(ctx, `UPDATE identity_roles SET description = $2 WHERE name = $1`, name, description)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM identity_role_permissions WHERE role = $1`, name); err != nil {
+		return err
+	}
+	for _, p := range perms {
+		if _, err := tx.Exec(ctx, `INSERT INTO identity_role_permissions (role, permission) VALUES ($1, $2) ON CONFLICT DO NOTHING`, name, p); err != nil {
+			return mapErr(err)
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// DeleteRole removes a role that no user and no client holds (ErrRoleInUse otherwise, ErrNotFound when
+// it does not exist). The role row is locked, so a concurrent AssignRole cannot slip in.
+func (s *Store) DeleteRole(ctx context.Context, name string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var held int64
+	if err := tx.QueryRow(ctx, `SELECT (SELECT count(*) FROM identity_user_roles WHERE role = r.name)
+		+ (SELECT count(*) FROM identity_client_roles WHERE role = r.name) FROM identity_roles r WHERE r.name = $1 FOR UPDATE`, name).Scan(&held); err != nil {
+		return mapErr(err)
+	}
+	if held > 0 {
+		return ErrRoleInUse
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM identity_roles WHERE name = $1`, name); err != nil {
+		return mapErr(err)
+	}
+	return tx.Commit(ctx)
+}
+
+const assignedCount = `(SELECT count(*) FROM identity_user_roles WHERE role = r.name) + (SELECT count(*) FROM identity_client_roles WHERE role = r.name)`
+
 // RoleByName returns the role.
 func (s *Store) RoleByName(ctx context.Context, name string) (*Role, error) {
 	var r Role
-	if err := s.pool.QueryRow(ctx, `SELECT name, description FROM identity_roles WHERE name = $1`, name).Scan(&r.Name, &r.Description); err != nil {
+	if err := s.pool.QueryRow(ctx, `SELECT r.name, r.description, `+assignedCount+` FROM identity_roles r WHERE r.name = $1`, name).Scan(&r.Name, &r.Description, &r.AssignedCount); err != nil {
 		return nil, mapErr(err)
 	}
 	var err error
@@ -428,11 +604,21 @@ func (s *Store) RoleByName(ctx context.Context, name string) (*Role, error) {
 	return &r, err
 }
 
-// ListRoles returns every role with its permissions.
-func (s *Store) ListRoles(ctx context.Context) ([]Role, error) {
-	rows, err := s.pool.Query(ctx, `SELECT r.name, r.description,
+// ListRoles returns the roles with their permissions; a query keeps the roles whose name or description
+// contains it (case insensitive) or that hold a permission containing it. Up to limit+1 roles come back, ordered by
+// name and starting after the name `after` ("" for the first page), so the caller can tell whether another page exists.
+func (s *Store) ListRoles(ctx context.Context, query, after string, limit int) ([]Role, error) {
+	like := ""
+	if query != "" {
+		like = likeContains(query)
+	}
+	rows, err := s.pool.Query(ctx, `SELECT r.name, r.description, `+assignedCount+`,
 		coalesce((SELECT array_agg(permission ORDER BY permission) FROM identity_role_permissions p WHERE p.role = r.name), '{}')
-		FROM identity_roles r ORDER BY r.name`)
+		FROM identity_roles r
+		WHERE ($1 = '' OR r.name ILIKE $1 OR r.description ILIKE $1
+		   OR EXISTS (SELECT 1 FROM identity_role_permissions q WHERE q.role = r.name AND q.permission ILIKE $1))
+		  AND r.name > $2
+		ORDER BY r.name LIMIT $3`, like, after, limit+1)
 	if err != nil {
 		return nil, err
 	}
@@ -440,12 +626,25 @@ func (s *Store) ListRoles(ctx context.Context) ([]Role, error) {
 	var out []Role
 	for rows.Next() {
 		var r Role
-		if err := rows.Scan(&r.Name, &r.Description, &r.Permissions); err != nil {
+		if err := rows.Scan(&r.Name, &r.Description, &r.AssignedCount, &r.Permissions); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// CountRoles counts the roles ListRoles finds for the query (every page).
+func (s *Store) CountRoles(ctx context.Context, query string) (int64, error) {
+	like := ""
+	if query != "" {
+		like = likeContains(query)
+	}
+	var n int64
+	err := s.pool.QueryRow(ctx, `SELECT count(*) FROM identity_roles r
+		WHERE ($1 = '' OR r.name ILIKE $1 OR r.description ILIKE $1
+		   OR EXISTS (SELECT 1 FROM identity_role_permissions q WHERE q.role = r.name AND q.permission ILIKE $1))`, like).Scan(&n)
+	return n, err
 }
 
 // AssignRole gives a role to a user or a client (exactly one of them is set).
@@ -627,10 +826,35 @@ func (s *Store) DeleteExchangePolicy(ctx context.Context, clientID, audience str
 	return nil
 }
 
-// ListExchangePolicies lists the policies, of one client when clientID is set.
-func (s *Store) ListExchangePolicies(ctx context.Context, clientID string) ([]ExchangePolicy, error) {
+// PolicyFilter narrows ListExchangePolicies; every empty field matches everything.
+type PolicyFilter struct {
+	// ClientID is exact.
+	ClientID string
+	// Query matches the client id, the audience or the max scope (contains, case insensitive).
+	Query string
+	// Audience matches the audience (contains, case insensitive).
+	Audience string
+	// AfterClientID and AfterAudience are the key of the last policy of the previous page (both empty for the first).
+	AfterClientID string
+	AfterAudience string
+}
+
+// ListExchangePolicies lists up to limit+1 policies that match the filter, ordered by client and audience, so the
+// caller can tell whether another page exists.
+func (s *Store) ListExchangePolicies(ctx context.Context, f PolicyFilter, limit int) ([]ExchangePolicy, error) {
+	query, audience := "", ""
+	if f.Query != "" {
+		query = likeContains(f.Query)
+	}
+	if f.Audience != "" {
+		audience = likeContains(f.Audience)
+	}
 	rows, err := s.pool.Query(ctx, `SELECT client_id, audience, max_scope, max_chain_depth FROM identity_exchange_policies
-		WHERE $1 = '' OR client_id = $1 ORDER BY client_id, audience`, clientID)
+		WHERE ($1 = '' OR client_id = $1)
+		  AND ($2 = '' OR client_id ILIKE $2 OR audience ILIKE $2 OR max_scope ILIKE $2)
+		  AND ($3 = '' OR audience ILIKE $3)
+		  AND (client_id, audience) > ($4, $5)
+		ORDER BY client_id, audience LIMIT $6`, f.ClientID, query, audience, f.AfterClientID, f.AfterAudience, limit+1)
 	if err != nil {
 		return nil, err
 	}

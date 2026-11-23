@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"strconv"
 	"strings"
 )
 
@@ -12,14 +13,46 @@ func likePrefix(text string) string {
 	return r.Replace(text) + "%"
 }
 
+// UserFilter narrows ListUsers; every empty field matches everyone.
+type UserFilter struct {
+	EmailPrefix  string // case insensitive
+	NameContains string // case insensitive
+	Status       string // "pending", "active" or "disabled" (the rule of the API: disabled first, then no password = pending)
+	Role         string
+}
+
+func likeContains(text string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return "%" + r.Replace(text) + "%"
+}
+
 // ListUsers returns up to limit users ordered by email, starting after the email `after`
-// ("" for the first page), whose email starts with prefix (case insensitive). It returns
-// limit+1 rows at most so the caller can tell whether another page exists, together with the
-// roles of each user.
-func (s *Store) ListUsers(ctx context.Context, prefix, after string, limit int) ([]User, map[string][]string, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+userCols+` FROM identity_users
-		WHERE email LIKE $1 ESCAPE '\' AND email > $2 ORDER BY email LIMIT $3`,
-		likePrefix(NormalizeEmail(prefix)), after, limit+1)
+// ("" for the first page), that match the filter. It returns limit+1 rows at most so the caller
+// can tell whether another page exists, together with the roles of each user.
+func (s *Store) ListUsers(ctx context.Context, f UserFilter, after string, limit int) ([]User, map[string][]string, error) {
+	where := []string{`email LIKE $1 ESCAPE '\'`, `email > $2`}
+	args := []any{likePrefix(NormalizeEmail(f.EmailPrefix)), after}
+	add := func(cond string, v any) {
+		args = append(args, v)
+		where = append(where, strings.Replace(cond, "?", "$"+strconv.Itoa(len(args)), 1))
+	}
+	if n := strings.TrimSpace(f.NameContains); n != "" {
+		add(`lower(name) LIKE ? ESCAPE '\'`, likeContains(strings.ToLower(n)))
+	}
+	switch f.Status {
+	case "disabled":
+		where = append(where, `disabled`)
+	case "pending":
+		where = append(where, `NOT disabled AND password_hash IS NULL`)
+	case "active":
+		where = append(where, `NOT disabled AND password_hash IS NOT NULL`)
+	}
+	if f.Role != "" {
+		add(`EXISTS (SELECT 1 FROM identity_user_roles r WHERE r.user_id = identity_users.id AND r.role = ?)`, f.Role)
+	}
+	args = append(args, limit+1)
+	rows, err := s.pool.Query(ctx, `SELECT `+userCols+` FROM identity_users WHERE `+strings.Join(where, " AND ")+
+		` ORDER BY email LIMIT $`+strconv.Itoa(len(args)), args...)
 	if err != nil {
 		return nil, nil, mapErr(err)
 	}

@@ -44,6 +44,7 @@ type Config struct {
 	MFAMode       string
 	MFAIssuerName string
 	ResetTTL      time.Duration // default 30 minutes
+	WelcomeTTL    time.Duration // validity of the set-password link of a new user, default 7 days
 	// RevokeTTL is how long the per-user token cutoff is kept: longer than any access token.
 	RevokeTTL time.Duration
 }
@@ -67,6 +68,9 @@ type Service struct {
 func New(cfg Config, st *store.Store, sta *state.State, tk *token.Service, sealer *mfa.Sealer, n notify.Notifier, log *zap.Logger) *Service {
 	if cfg.ResetTTL <= 0 {
 		cfg.ResetTTL = 30 * time.Minute
+	}
+	if cfg.WelcomeTTL <= 0 {
+		cfg.WelcomeTTL = 7 * 24 * time.Hour
 	}
 	if cfg.RevokeTTL <= 0 {
 		cfg.RevokeTTL = time.Hour
@@ -382,13 +386,40 @@ func (s *Service) RequestReset(ctx context.Context, email, ip string) error {
 // SendReset sends a reset mail to a known user (admin API).
 func (s *Service) SendReset(ctx context.Context, u *store.User) error { return s.sendReset(ctx, u, "") }
 
-func (s *Service) sendReset(ctx context.Context, u *store.User, ip string) error {
-	tok := password.Random(32)
-	id, err := s.Store.CreatePasswordReset(ctx, u.ID, password.Digest(tok), ip, s.now().Add(s.Cfg.ResetTTL))
+// ErrNotPending is returned by SendWelcome for a user who already has a password.
+var ErrNotPending = errors.New("account: the user already has a password")
+
+// SendWelcome sends the welcome mail with a link to set the first password (admin API). It is
+// for a user who has no password yet; the link lives Cfg.WelcomeTTL and replaces older links.
+func (s *Service) SendWelcome(ctx context.Context, u *store.User) error {
+	if u.PasswordHash != "" {
+		return ErrNotPending
+	}
+	link, id, err := s.issueLink(ctx, u, "", s.Cfg.WelcomeTTL)
 	if err != nil {
 		return err
 	}
-	link := strings.TrimRight(s.Cfg.Issuer, "/") + "/password/reset?token=" + url.QueryEscape(tok)
+	user := mailUser(u)
+	ttl := s.Cfg.WelcomeTTL
+	s.background("welcome mail", func(ctx context.Context) error { return s.Notify.Welcome(ctx, user, link, ttl, id) })
+	return nil
+}
+
+// issueLink creates a single-use reset token valid for ttl and returns the link to the reset page.
+func (s *Service) issueLink(ctx context.Context, u *store.User, ip string, ttl time.Duration) (link, id string, err error) {
+	tok := password.Random(32)
+	id, err = s.Store.CreatePasswordReset(ctx, u.ID, password.Digest(tok), ip, s.now().Add(ttl))
+	if err != nil {
+		return "", "", err
+	}
+	return strings.TrimRight(s.Cfg.Issuer, "/") + "/password/reset?token=" + url.QueryEscape(tok), id, nil
+}
+
+func (s *Service) sendReset(ctx context.Context, u *store.User, ip string) error {
+	link, id, err := s.issueLink(ctx, u, ip, s.Cfg.ResetTTL)
+	if err != nil {
+		return err
+	}
 	user := mailUser(u)
 	ttl := s.Cfg.ResetTTL
 	s.background("reset mail", func(ctx context.Context) error { return s.Notify.PasswordReset(ctx, user, link, ttl, id) })

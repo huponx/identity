@@ -14,6 +14,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The image copies the sign in pages from the auth-ui image of the web repository: its tag must exist.
+  auth-ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - run: scripts/check-auth-ui.sh
+
   pr:
     uses: huponx/actions/.github/workflows/service-pr.yml@v1
     secrets: inherit
