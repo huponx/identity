@@ -42,6 +42,8 @@ var Permissions = map[string]string{
 	"/identity.v1.IdentityService/GetMe":                grpcserver.Public,
 	"/identity.v1.IdentityService/UpdateMe":             grpcserver.Public,
 	"/identity.v1.IdentityService/SetMyAvatar":          grpcserver.Public,
+	"/identity.v1.IdentityService/GetMyUserSettings":    grpcserver.Public,
+	"/identity.v1.IdentityService/PutMyUserSettings":    grpcserver.Public,
 	"/identity.v1.IdentityService/CreateRole":           "identity:role:write",
 	"/identity.v1.IdentityService/SetRolePermissions":   "identity:role:write",
 	"/identity.v1.IdentityService/UpdateRole":           "identity:role:write",
