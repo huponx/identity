@@ -28,6 +28,8 @@ var (
 	ErrRoleInUse = errors.New("store: role is held by a user or a client")
 	// ErrClientNotDisabled: only a disabled client can be deleted.
 	ErrClientNotDisabled = errors.New("store: client is not disabled")
+	// ErrLastAdmin: the user is the last one holding the admin role and cannot be deleted.
+	ErrLastAdmin = errors.New("store: user is the last admin")
 )
 
 // Store wraps the pool.
@@ -146,12 +148,12 @@ func (s *Store) UserByID(ctx context.Context, id string) (*User, error) {
 	if _, err := uuid.Parse(id); err != nil {
 		return nil, ErrNotFound
 	}
-	return scanUser(s.pool.QueryRow(ctx, `SELECT `+userCols+` FROM identity_users WHERE id = $1`, id))
+	return scanUser(s.pool.QueryRow(ctx, `SELECT `+userCols+` FROM identity_users WHERE id = $1 AND deleted_at IS NULL`, id))
 }
 
 // UserByEmail returns the user.
 func (s *Store) UserByEmail(ctx context.Context, email string) (*User, error) {
-	return scanUser(s.pool.QueryRow(ctx, `SELECT `+userCols+` FROM identity_users WHERE email = $1`, NormalizeEmail(email)))
+	return scanUser(s.pool.QueryRow(ctx, `SELECT `+userCols+` FROM identity_users WHERE email = $1 AND deleted_at IS NULL`, NormalizeEmail(email)))
 }
 
 func (s *Store) execUser(ctx context.Context, id, sql string, args ...any) error {
@@ -168,9 +170,66 @@ func (s *Store) execUser(ctx context.Context, id, sql string, args ...any) error
 	return nil
 }
 
+// DeleteUser soft deletes the account in one transaction: the row is locked, deleted_at is set, the user is
+// disabled, the email becomes <id>@deleted.invalid (free for a new registration) and the name and the personal
+// data of the row are cleared, and the small tables of identity (roles, refresh tokens, MFA, password resets,
+// settings: a few rows each) are emptied. The data of the other services is deleted by their own purge (the
+// dictionary cleanup), the row itself at the end of it. The caller revokes the sessions after the commit.
+// Deleting a deleted user succeeds and changes nothing; the last active admin is refused (ErrLastAdmin).
+func (s *Store) DeleteUser(ctx context.Context, id string) error {
+	if _, err := uuid.Parse(id); err != nil {
+		return ErrNotFound
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	// one delete of an admin at a time: with two admins deleted at once each would count the other as the rest
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('identity-admins'))`); err != nil {
+		return err
+	}
+	var deleted bool
+	if err := tx.QueryRow(ctx, `SELECT deleted_at IS NOT NULL FROM identity_users WHERE id = $1 FOR UPDATE`, id).Scan(&deleted); err != nil {
+		return mapErr(err)
+	}
+	if deleted {
+		return nil
+	}
+	var admin bool
+	var others int
+	if err := tx.QueryRow(ctx, `SELECT
+		EXISTS (SELECT 1 FROM identity_user_roles WHERE user_id = $1 AND role = 'admin'),
+		(SELECT count(*) FROM identity_user_roles r JOIN identity_users u ON u.id = r.user_id
+			WHERE r.role = 'admin' AND r.user_id <> $1 AND u.deleted_at IS NULL AND NOT u.disabled)`, id).Scan(&admin, &others); err != nil {
+		return mapErr(err)
+	}
+	if admin && others == 0 {
+		return ErrLastAdmin
+	}
+	for _, q := range []string{
+		`DELETE FROM identity_user_roles WHERE user_id = $1`,
+		`DELETE FROM identity_refresh_tokens WHERE user_id = $1`,
+		`DELETE FROM identity_user_mfa_factors WHERE user_id = $1`,
+		`DELETE FROM identity_mfa_recovery_codes WHERE user_id = $1`,
+		`DELETE FROM identity_password_resets WHERE user_id = $1`,
+		`DELETE FROM identity_user_settings WHERE user_id = $1`,
+	} {
+		if _, err := tx.Exec(ctx, q, id); err != nil {
+			return mapErr(err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE identity_users SET deleted_at = now(), disabled = true,
+		email = id::text || '@deleted.invalid', name = '', password_hash = NULL, avatar = NULL, avatar_mime = NULL,
+		mfa_enabled = false, mfa_enforced = false, updated_at = now() WHERE id = $1`, id); err != nil {
+		return mapErr(err)
+	}
+	return tx.Commit(ctx)
+}
+
 // SetUserDisabled enables or disables the account.
 func (s *Store) SetUserDisabled(ctx context.Context, id string, disabled bool) error {
-	return s.execUser(ctx, id, `UPDATE identity_users SET disabled = $2, updated_at = now() WHERE id = $1`, disabled)
+	return s.execUser(ctx, id, `UPDATE identity_users SET disabled = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL`, disabled)
 }
 
 // UpdateUser changes the name and, when locale is not empty, the locale.

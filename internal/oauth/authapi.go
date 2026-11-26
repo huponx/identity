@@ -3,7 +3,9 @@ package oauth
 import (
 	"errors"
 	"net/http"
+	"net/mail"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -45,6 +47,7 @@ var apiMessages = map[string]string{
 	"password_common":          "The password is too common.",
 	"password_same":            "The password must differ from the previous one.",
 	"password_email":           "The password must not contain the e-mail address.",
+	"invalid_email":            "Enter a valid e-mail address.",
 	"internal":                 "Something went wrong. Please try again.",
 }
 
@@ -109,6 +112,7 @@ func (s *Server) authAPI(r *gin.Engine) {
 	a.GET("/login/password", s.apiPasswordChangeCheck)
 	a.POST("/login/password", s.apiPasswordChange)
 
+	a.POST("/register", s.apiRegister)
 	a.POST("/password/forgot", s.apiForgot)
 	a.GET("/password/reset", s.apiResetCheck)
 	a.POST("/password/reset", s.apiReset)
@@ -161,7 +165,7 @@ func (s *Server) apiUIStyle(c *gin.Context) {
 			palettes[st] = p
 		}
 	}
-	c.JSON(http.StatusOK, gin.H{"uiStyle": style, "uiPalettes": palettes})
+	c.JSON(http.StatusOK, gin.H{"uiStyle": style, "uiPalettes": palettes, "registration": s.cfg.RegistrationEnabled})
 }
 
 // apiPreferences answers the theme and the language of the signed in user's account, which the pages keep in step with the apps.
@@ -414,6 +418,48 @@ func (s *Server) apiPasswordChange(c *gin.Context) {
 		return
 	}
 	next(c, to)
+}
+
+// ---- registration ----
+
+// apiRegister creates the account of a visitor. The answer is the same whether or not the address has an account.
+func (s *Server) apiRegister(c *gin.Context) {
+	if !s.cfg.RegistrationEnabled {
+		s.apiError(c, http.StatusNotFound, "not_found")
+		return
+	}
+	var req struct {
+		csrfBody
+		Email  string `json:"email"`
+		Name   string `json:"name"`
+		Locale string `json:"locale"`
+	}
+	if !s.readJSON(c, &req) {
+		return
+	}
+	email, name := store.NormalizeEmail(req.Email), strings.TrimSpace(req.Name)
+	if _, err := mail.ParseAddress(email); err != nil || !strings.Contains(email, "@") || len(email) > 254 || strings.ContainsAny(email, " <>") {
+		s.apiError(c, http.StatusBadRequest, "invalid_email")
+		return
+	}
+	if len([]rune(name)) > 200 {
+		s.apiError(c, http.StatusBadRequest, "bad_request")
+		return
+	}
+	locale := "en"
+	if req.Locale == "vi" {
+		locale = "vi"
+	}
+	u := store.User{Email: email, Name: name, Locale: locale}
+	if err := s.acct.Register(c.Request.Context(), u, []string{s.cfg.RegistrationRole}, c.ClientIP()); err != nil {
+		if errors.Is(err, account.ErrRateLimited) {
+			s.apiError(c, http.StatusTooManyRequests, "rate_limited")
+			return
+		}
+		s.apiFail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{})
 }
 
 // ---- password reset ----

@@ -138,6 +138,30 @@ func (s *Service) PasswordLogin(ctx context.Context, email, pw, ip string) (*sto
 	return u, nil
 }
 
+// ChangePassword is the change of the own password of a signed-in user: the current password is checked
+// first (failures are limited per user, like a login) and the policy applies to the new one. As
+// SetPassword it ends every session and token of the user.
+func (s *Service) ChangePassword(ctx context.Context, u *store.User, current, newPassword string) error {
+	ok, err := s.State.Allow(ctx, "chpw:user:"+u.ID, 5, 15*time.Minute)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrRateLimited
+	}
+	if u.PasswordHash == "" || !password.Verify(current, u.PasswordHash) {
+		if u.PasswordHash == "" {
+			password.DummyVerify(current)
+		}
+		return ErrInvalidCredentials
+	}
+	if err := s.SetPassword(ctx, u, newPassword, true); err != nil {
+		return err
+	}
+	_ = s.State.Reset(ctx, "chpw:user:"+u.ID)
+	return nil
+}
+
 // ---- MFA ----
 
 // Requirement is what a login needs after the password.
@@ -351,6 +375,34 @@ func (s *Service) mailMFA(u *store.User, change string) {
 	id := uuid.NewString()
 	user := mailUser(u)
 	s.background("mfa mail", func(ctx context.Context) error { return s.Notify.MFAChanged(ctx, user, change, id) })
+}
+
+// ---- registration ----
+
+// Register creates the account of a visitor (no password) and sends the welcome mail with the link to set it. It
+// never says whether the e-mail was known: an existing account (or a rate limited address) is answered like a new one,
+// and nothing is sent to it. Only the limit per client IP is reported, which tells nothing about any account.
+func (s *Service) Register(ctx context.Context, u store.User, roles []string, ip string) error {
+	u.Email = store.NormalizeEmail(u.Email)
+	if ok, err := s.State.Allow(ctx, "register:ip:"+ip, 10, time.Hour); err != nil {
+		return err
+	} else if !ok {
+		return ErrRateLimited
+	}
+	if ok, err := s.State.Allow(ctx, "register:email:"+u.Email, 3, time.Hour); err != nil {
+		return err
+	} else if !ok {
+		s.Log.Warn("registration rate limited", zap.String("key", "register:email"))
+		return nil
+	}
+	created, err := s.Store.CreateUser(ctx, u, roles)
+	if errors.Is(err, store.ErrConflict) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return s.SendWelcome(ctx, created)
 }
 
 // ---- password reset ----

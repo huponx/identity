@@ -28,7 +28,7 @@ func permissionName(name, permission string) string {
 
 func checkDescription(d string) error {
 	if len([]rune(d)) > maxPermissionDescription {
-		return apperror.InvalidArgument("description is too long")
+		return apperror.InvalidArgument("description is too long").WithReason("description_too_long")
 	}
 	return nil
 }
@@ -64,7 +64,7 @@ func (s *Service) ListPermissions(ctx context.Context, req *identityv1.ListPermi
 func (s *Service) CreatePermission(ctx context.Context, req *identityv1.CreatePermissionRequest) (*identityv1.CreatePermissionResponse, error) {
 	name := strings.TrimSpace(req.GetPermission().GetName())
 	if !authz.Valid(name) {
-		return nil, apperror.InvalidArgument("invalid permission " + name)
+		return nil, apperror.InvalidArgument("invalid permission "+name).WithReason("invalid_permission", "name", name)
 	}
 	d := strings.TrimSpace(req.GetPermission().GetDescription())
 	if err := checkDescription(d); err != nil {
@@ -93,7 +93,7 @@ func (s *Service) DeletePermission(ctx context.Context, req *identityv1.DeletePe
 	err := s.Store.DeletePermission(ctx, name)
 	if errors.Is(err, store.ErrPermissionInUse) {
 		roles, _ := s.Store.PermissionRoles(ctx, name)
-		return nil, apperror.FailedPrecondition("the permission is held by the roles: " + strings.Join(roles, ", "))
+		return nil, apperror.FailedPrecondition("the permission is held by the roles: "+strings.Join(roles, ", ")).WithReason("permission_held_by_roles", "roles", strings.Join(roles, ", "))
 	}
 	if err != nil {
 		return nil, toErr(err)

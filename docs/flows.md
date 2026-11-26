@@ -40,12 +40,13 @@ Two listeners run in one process:
 | `POST /oauth2/introspect` | `introspect` (`tokens.go`) |
 | `GET, POST /userinfo` | `userinfo` (`tokens.go`) |
 | `GET, POST /oauth2/logout` | `endSession` (`logout.go`) |
-| `GET /login`, `/login/mfa`, `/login/password`, `/password/forgot`, `/password/reset`, `/account/mfa`, `/logout`, `/error` | `spa` (`server.go`): `index.html` of the sign in app (`IDENTITY_UI_DIR`); the app routes itself |
+| `GET /login`, `/login/mfa`, `/login/password`, `/register`, `/password/forgot`, `/password/reset`, `/account/mfa`, `/logout`, `/error` | `spa` (`server.go`): `index.html` of the sign in app (`IDENTITY_UI_DIR`); the app routes itself |
 | `GET /assets/*`, `/logo.svg`, `/theme-init.js` | files of the sign in app (`pages` in `server.go`) |
 | `GET /auth-api/csrf` | `csrfToken`: sets the `csrf` cookie, returns the token |
 | `POST /auth-api/login` | `apiLogin` (`authapi.go`) |
 | `GET, POST /auth-api/login/mfa` | `apiMFACheck`, `apiMFA` |
 | `GET, POST /auth-api/login/password` | `apiPasswordChangeCheck`, `apiPasswordChange`: forced change of a temporary password |
+| `POST /auth-api/register` | `apiRegister`: 404 unless `IDENTITY_REGISTRATION_ENABLED`; `{email, name, locale}`; `account.Register` creates the user (no password) with `IDENTITY_REGISTRATION_ROLE` and sends the welcome mail (`SendWelcome`, link to set the password). The answer is `{}` whether or not the address had an account (nothing is sent to an existing one); only the per-IP limit answers 429 |
 | `POST /auth-api/password/forgot` | `apiForgot` |
 | `GET, POST /auth-api/password/reset` | `apiResetCheck`, `apiReset` |
 | `GET, POST /auth-api/account/mfa`, `POST /auth-api/account/mfa/disable` | `apiAccountMFA`, `apiAccountMFAConfirm`, `apiAccountMFADisable` |
@@ -708,7 +709,7 @@ anything else → Internal without details).
 | `ListPermissions` | `identity:permission:read` | the catalog of permissions, with how many roles hold each; paged by token (see below) |
 | `CreatePermission`, `UpdatePermission`, `DeletePermission` | `identity:permission:write` | roles can only hold catalog permissions (FK `identity_role_permissions_permission_fkey`); a permission held by a role cannot be deleted |
 | `GetUserStats` | `identity:user:read` | counts by status, plus `created_this_month` (UTC) (active/pending/disabled), MFA, avatar, activity |
-| `GetMe`, `UpdateMe`, `SetMyAvatar` | any user token (`grpcserver.Public`) | the user is the token subject (`meID`), never a request field; service tokens are refused; `UpdateMe` keeps empty fields |
+| `GetMe`, `UpdateMe`, `SetMyAvatar`, `ChangeMyPassword`, `GetMyMFA`, `BeginMyMFA`, `ConfirmMyMFA`, `DisableMyMFA` | any user token (`grpcserver.Public`) | the user is the token subject (`meID`), never a request field; service tokens are refused; `UpdateMe` keeps empty fields; `ChangeMyPassword` checks the current password (limited to 5 failures per 15 minutes per user), applies the policy and, like `SetUserPassword`, ends every session and token of the user, the caller's too; the MFA methods call `BeginEnrollment`, `ConfirmEnrollment` and `DisableMFA` of `account` (the same steps and limits as the account page of the sign in app; `BeginMyMFA` creates the pending enrollment of a user who has none; `GetMyMFA` only reads the status) |
 | `SendWelcome` | `identity:user:write` | `account.SendWelcome`: set-password link valid 7 days, only while the user has no password |
 | `CreateRole`, `SetRolePermissions`, `AssignRole`, `RevokeRole` | `identity:role:write` | `authz.Valid` on each permission; roles go to a user **or** a client |
 | `UpdateRole` | `identity:role:write` | replaces description and permissions of a role in one transaction |
