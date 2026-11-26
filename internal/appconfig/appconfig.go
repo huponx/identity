@@ -3,11 +3,15 @@ package appconfig
 import (
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/huponx/gocommon/config"
 )
+
+// roleName is the shape of a role name (the CHECK of identity_roles).
+var roleName = regexp.MustCompile(`^[a-z][a-z0-9_.-]*$`)
 
 // MFA modes of IDENTITY_MFA_MODE.
 const (
@@ -69,6 +73,13 @@ type Identity struct {
 	// (the ingress controller). Empty: the connection address is used, which is safe but makes the
 	// per-IP rate limits count the ingress as one client.
 	TrustedProxies []string `env:"IDENTITY_TRUSTED_PROXIES" envSeparator:","`
+
+	// RegistrationEnabled opens POST /auth-api/register: anybody may create an account (the welcome mail with the
+	// link to set the password proves the address). Off by default, then the endpoint answers 404. There is no
+	// CAPTCHA, only the rate limit per client IP and per e-mail.
+	RegistrationEnabled bool `env:"IDENTITY_REGISTRATION_ENABLED" envDefault:"false"`
+	// RegistrationRole is the role a self-registered account gets; it must exist (migration V36 creates "member").
+	RegistrationRole string `env:"IDENTITY_REGISTRATION_ROLE" envDefault:"member"`
 
 	// UIDir holds the built sign in app (index.html and assets/); the image has it in /ui. Outside ENV=local
 	// the service does not start without it; locally the page paths answer 503 and a warning is logged.
@@ -159,6 +170,9 @@ func (c Identity) Validate() error {
 	}
 	if !c.IsLocal() && !strings.HasPrefix(c.Issuer, "https://") {
 		return fmt.Errorf("IDENTITY_ISSUER must be https outside ENV=local")
+	}
+	if c.RegistrationEnabled && !roleName.MatchString(c.RegistrationRole) {
+		return fmt.Errorf("IDENTITY_REGISTRATION_ROLE must be a role name (lowercase letters, digits, _ . -), got %q", c.RegistrationRole)
 	}
 	if _, err := c.AppLinks(); err != nil {
 		return err

@@ -43,6 +43,9 @@ type Config struct {
 	// RequireUI makes Routes fail when UIDir has no index.html (outside local runs: a service without
 	// its sign in pages must not start).
 	RequireUI bool
+	// RegistrationEnabled opens POST /auth-api/register; RegistrationRole is the role of the new account.
+	RegistrationEnabled bool
+	RegistrationRole    string
 }
 
 // Server serves the endpoints.
@@ -113,7 +116,7 @@ func (s *Server) pages(r *gin.Engine) error {
 		c.Redirect(http.StatusFound, "/login")
 	})
 	// the page paths of the app; e-mailed links and return_to values use them
-	for _, p := range []string{"/login", "/login/mfa", "/login/password", "/password/forgot", "/password/reset", "/account/mfa", "/apps", "/logout", "/error"} {
+	for _, p := range []string{"/login", "/login/mfa", "/login/password", "/register", "/password/forgot", "/password/reset", "/account/mfa", "/apps", "/logout", "/error"} {
 		r.GET(p, s.spa)
 	}
 	if s.index != nil {

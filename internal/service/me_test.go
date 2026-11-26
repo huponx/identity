@@ -2,7 +2,12 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
+
+	"github.com/huponx/gocommon/apperror"
+	"github.com/huponx/identity/internal/account"
+	"github.com/huponx/identity/internal/password"
 
 	"github.com/huponx/gocommon/authn"
 	"github.com/huponx/gocommon/grpcserver"
@@ -35,7 +40,7 @@ func TestMeID(t *testing.T) {
 
 // The "me" methods need only a signed-in user; every other method of the user API needs a permission.
 func TestMePermissionsArePublic(t *testing.T) {
-	for _, m := range []string{"GetMe", "UpdateMe", "SetMyAvatar"} {
+	for _, m := range []string{"GetMe", "UpdateMe", "SetMyAvatar", "ChangeMyPassword", "GetMyMFA", "BeginMyMFA", "ConfirmMyMFA", "DisableMyMFA"} {
 		if got := Permissions["/identity.v1.IdentityService/"+m]; got != grpcserver.Public {
 			t.Errorf("%s: %q", m, got)
 		}
@@ -50,5 +55,23 @@ func TestIsCallerClient(t *testing.T) {
 	}
 	if s.isCallerClient(context.Background(), "web") {
 		t.Fatal("no principal, no caller client")
+	}
+}
+
+// The errors of a password change reach the user with a reason the web apps translate.
+func TestChangePasswordErrorReasons(t *testing.T) {
+	cases := map[error]string{
+		account.ErrInvalidCredentials: "wrong_current_password",
+		account.ErrRateLimited:        "too_many_attempts",
+		password.ErrTooShort:          "password_too_short",
+		password.ErrSame:              "password_same",
+		account.ErrInvalidCode:        "invalid_mfa_code",
+		account.ErrMFAEnabled:         "mfa_already_enabled",
+	}
+	for in, want := range cases {
+		var app *apperror.Error
+		if !errors.As(toErr(in), &app) || app.Reason != want {
+			t.Errorf("%v: got %+v, want reason %q", in, toErr(in), want)
+		}
 	}
 }

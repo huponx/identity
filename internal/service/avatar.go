@@ -22,7 +22,7 @@ const (
 // that type with sane dimensions.
 func checkAvatar(data []byte, mime string) error {
 	if len(data) > maxAvatarBytes {
-		return apperror.InvalidArgument("the picture is larger than 64 KiB")
+		return apperror.InvalidArgument("the picture is larger than 64 KiB").WithReason("avatar_too_large")
 	}
 	var cfg image.Config
 	var err error
@@ -34,13 +34,13 @@ func checkAvatar(data []byte, mime string) error {
 	case "image/webp":
 		cfg, err = webp.DecodeConfig(bytes.NewReader(data))
 	default:
-		return apperror.InvalidArgument("mime_type must be image/png, image/jpeg or image/webp")
+		return apperror.InvalidArgument("mime_type must be image/png, image/jpeg or image/webp").WithReason("avatar_mime_type")
 	}
 	if err != nil {
-		return apperror.InvalidArgument("the picture is not a valid " + mime)
+		return apperror.InvalidArgument("the picture is not a valid "+mime).WithReason("avatar_invalid", "mime_type", mime)
 	}
 	if cfg.Width < 1 || cfg.Height < 1 || cfg.Width > maxAvatarSide || cfg.Height > maxAvatarSide {
-		return apperror.InvalidArgument("the picture must be at most 512x512")
+		return apperror.InvalidArgument("the picture must be at most 512x512").WithReason("avatar_dimensions")
 	}
 	return nil
 }
