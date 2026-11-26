@@ -1,6 +1,9 @@
 package appconfig
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func ident(env string, apps ...string) Identity {
 	var c Identity
@@ -41,5 +44,21 @@ func TestAppLinks(t *testing.T) {
 	}
 	if got, err := (Identity{}).AppLinks(); err != nil || len(got) != 0 {
 		t.Errorf("empty: %v %v", got, err)
+	}
+}
+
+func TestValidateRegistrationRole(t *testing.T) {
+	base := Identity{MFAMode: MFAOff, Issuer: "https://id.example", GRPCPort: 9090, HTTPPort: 8080, SessionIdleTTL: time.Hour, SessionAbsoluteTTL: time.Hour}
+	for role, ok := range map[string]bool{"member": true, "a.b-c_1": true, "": false, "Member": false, "1x": false, "a b": false} {
+		c := base
+		c.RegistrationEnabled, c.RegistrationRole = true, role
+		if err := c.Validate(); (err == nil) != ok {
+			t.Errorf("role %q: %v", role, err)
+		}
+	}
+	c := base
+	c.RegistrationRole = "Bad Role" // not checked while registration is off
+	if err := c.Validate(); err != nil {
+		t.Errorf("registration off: %v", err)
 	}
 }

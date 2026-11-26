@@ -6,8 +6,8 @@ require (
 	github.com/gin-gonic/gin v1.12.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
-	github.com/huponx/gocommon v0.4.1
-	github.com/huponx/protogen/go v0.1.12
+	github.com/huponx/gocommon v0.4.3
+	github.com/huponx/protogen/go v0.1.13
 	github.com/jackc/pgx/v5 v5.13.0
 	github.com/redis/go-redis/v9 v9.24.0
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e

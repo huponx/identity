@@ -30,7 +30,7 @@ func likeContains(text string) string {
 // ("" for the first page), that match the filter. It returns limit+1 rows at most so the caller
 // can tell whether another page exists, together with the roles of each user.
 func (s *Store) ListUsers(ctx context.Context, f UserFilter, after string, limit int) ([]User, map[string][]string, error) {
-	where := []string{`email LIKE $1 ESCAPE '\'`, `email > $2`}
+	where := []string{`deleted_at IS NULL`, `email LIKE $1 ESCAPE '\'`, `email > $2`}
 	args := []any{likePrefix(NormalizeEmail(f.EmailPrefix)), after}
 	add := func(cond string, v any) {
 		args = append(args, v)

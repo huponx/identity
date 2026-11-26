@@ -6,6 +6,9 @@ import (
 
 	"github.com/huponx/gocommon/apperror"
 	"github.com/huponx/gocommon/authn"
+	"github.com/huponx/identity/internal/account"
+	"github.com/huponx/identity/internal/appconfig"
+	"github.com/huponx/identity/internal/store"
 	identityv1 "github.com/huponx/protogen/go/identity/v1"
 )
 
@@ -16,7 +19,7 @@ import (
 func meID(ctx context.Context) (string, error) {
 	p := authn.FromContext(ctx)
 	if p == nil || p.Subject == "" || p.IsService() {
-		return "", apperror.PermissionDenied("a user token is required")
+		return "", apperror.PermissionDenied("a user token is required").WithReason("user_token_required")
 	}
 	return p.Subject, nil
 }
@@ -55,13 +58,13 @@ func (s *Service) UpdateMe(ctx context.Context, req *identityv1.UpdateMeRequest)
 		name = u.Name
 	}
 	if len([]rune(name)) > 200 {
-		return nil, apperror.InvalidArgument("name is too long")
+		return nil, apperror.InvalidArgument("name is too long").WithReason("name_too_long")
 	}
 	if l := req.GetLocale(); l != "" && !locales[l] {
-		return nil, apperror.InvalidArgument("unsupported locale")
+		return nil, apperror.InvalidArgument("unsupported locale").WithReason("unsupported_locale")
 	}
 	if t := req.GetTheme(); t != "" && !themes[t] {
-		return nil, apperror.InvalidArgument("unsupported theme")
+		return nil, apperror.InvalidArgument("unsupported theme").WithReason("unsupported_theme")
 	}
 	if err := s.Store.UpdateUser(ctx, id, name, req.GetLocale()); err != nil {
 		return nil, toErr(err)
@@ -96,4 +99,85 @@ func (s *Service) SetMyAvatar(ctx context.Context, req *identityv1.SetMyAvatarRe
 		return nil, toErr(err)
 	}
 	return &identityv1.SetMyAvatarResponse{}, nil
+}
+
+func (s *Service) ChangeMyPassword(ctx context.Context, req *identityv1.ChangeMyPasswordRequest) (*identityv1.ChangeMyPasswordResponse, error) {
+	id, err := meID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	u, err := s.Store.UserByID(ctx, id)
+	if err != nil {
+		return nil, toErr(err)
+	}
+	if err := s.Acct.ChangePassword(ctx, u, req.GetCurrentPassword(), req.GetNewPassword()); err != nil {
+		return nil, toErr(err)
+	}
+	return &identityv1.ChangeMyPasswordResponse{}, nil
+}
+
+// myUser is the signed-in user, read fresh (the MFA flags change under a session).
+func (s *Service) myUser(ctx context.Context) (*store.User, error) {
+	id, err := meID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	u, err := s.Store.UserByID(ctx, id)
+	if err != nil {
+		return nil, toErr(err)
+	}
+	return u, nil
+}
+
+func (s *Service) GetMyMFA(ctx context.Context, _ *identityv1.GetMyMFARequest) (*identityv1.GetMyMFAResponse, error) {
+	u, err := s.myUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if u.MFAEnabled {
+		left, err := s.Store.RecoveryCodesLeft(ctx, u.ID)
+		if err != nil {
+			return nil, toErr(err)
+		}
+		return &identityv1.GetMyMFAResponse{Enabled: true, Forced: s.Acct.MFAForced(u), RecoveryCodesLeft: int32(left)}, nil
+	}
+	if s.MFAMode == appconfig.MFAOff {
+		return nil, toErr(account.ErrMFAOff)
+	}
+	return &identityv1.GetMyMFAResponse{Forced: s.Acct.MFAForced(u)}, nil
+}
+
+func (s *Service) BeginMyMFA(ctx context.Context, _ *identityv1.BeginMyMFARequest) (*identityv1.BeginMyMFAResponse, error) {
+	u, err := s.myUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	enr, err := s.Acct.BeginEnrollment(ctx, u)
+	if err != nil {
+		return nil, toErr(err)
+	}
+	return &identityv1.BeginMyMFAResponse{Qr: enr.QRData, Secret: enr.Secret}, nil
+}
+
+func (s *Service) ConfirmMyMFA(ctx context.Context, req *identityv1.ConfirmMyMFARequest) (*identityv1.ConfirmMyMFAResponse, error) {
+	u, err := s.myUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	codes, err := s.Acct.ConfirmEnrollment(ctx, u, req.GetCode())
+	if err != nil {
+		return nil, toErr(err)
+	}
+	return &identityv1.ConfirmMyMFAResponse{RecoveryCodes: codes}, nil
+}
+
+func (s *Service) DisableMyMFA(ctx context.Context, req *identityv1.DisableMyMFARequest) (*identityv1.DisableMyMFAResponse, error) {
+	u, err := s.myUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.Acct.DisableMFA(ctx, u, req.GetPassword(), req.GetCode()); err != nil {
+		return nil, toErr(err)
+	}
+	return &identityv1.DisableMyMFAResponse{}, nil
 }

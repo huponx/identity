@@ -30,7 +30,7 @@ func (s *Store) UserStats(ctx context.Context) (*UserStats, error) {
 		count(*) FILTER (WHERE last_login_at > now() - interval '30 days'),
 		count(*) FILTER (WHERE last_login_at IS NULL),
 		count(*) FILTER (WHERE created_at >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
-		FROM identity_users`).Scan(&st.Total, &st.Active, &st.Pending, &st.Disabled,
+		FROM identity_users WHERE deleted_at IS NULL`).Scan(&st.Total, &st.Active, &st.Pending, &st.Disabled,
 		&st.MFAEnabled, &st.MFAEnforced, &st.WithAvatar, &st.SignedIn30d, &st.NeverSignedIn, &st.CreatedThisMonth)
 	if err != nil {
 		return nil, mapErr(err)

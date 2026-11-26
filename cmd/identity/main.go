@@ -114,6 +114,7 @@ func main() {
 		SessionIdle: cfg.SessionIdleTTL, SessionAbsolute: cfg.SessionAbsoluteTTL, MFAMode: cfg.MFAMode,
 		TrustedProxies: cfg.TrustedProxies, AccessTokenDefault: cfg.AccessTokenTTL, RefreshTokenTTL: cfg.RefreshTokenTTL,
 		UIDir: cfg.UIDir, RequireUI: !cfg.IsLocal(), Apps: apps,
+		RegistrationEnabled: cfg.RegistrationEnabled, RegistrationRole: cfg.RegistrationRole,
 	}, acct, st, sta, tokens, keySet, log)
 	if err := web.Routes(router); err != nil {
 		log.Fatal("http routes", zap.Error(err))

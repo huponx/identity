@@ -51,14 +51,14 @@ func (s *Service) GetUIStyle(ctx context.Context, _ *identityv1.GetUIStyleReques
 func (s *Service) SetUIStyle(ctx context.Context, req *identityv1.SetUIStyleRequest) (*identityv1.SetUIStyleResponse, error) {
 	v := req.GetUiStyle()
 	if !uiStyles[v] {
-		return nil, apperror.InvalidArgument("ui_style must be saas, glass or mono")
+		return nil, apperror.InvalidArgument("ui_style must be saas, glass or mono").WithReason("ui_style_invalid")
 	}
 	for style, p := range req.GetUiPalettes() {
 		if !uiStyles[style] {
-			return nil, apperror.InvalidArgument("ui_palettes keys must be saas, glass or mono")
+			return nil, apperror.InvalidArgument("ui_palettes keys must be saas, glass or mono").WithReason("ui_palettes_keys_invalid")
 		}
 		if !uiPalettes[p] {
-			return nil, apperror.InvalidArgument("ui_palettes values must be aurora, ocean, sunset, mint, rose or graphite")
+			return nil, apperror.InvalidArgument("ui_palettes values must be aurora, ocean, sunset, mint, rose or graphite").WithReason("ui_palettes_values_invalid")
 		}
 	}
 	stored, err := s.Store.UIPalettes(ctx)

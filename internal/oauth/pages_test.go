@@ -52,7 +52,7 @@ func TestPagesServeTheApp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range []string{"/login", "/login/mfa", "/login/password", "/password/forgot", "/password/reset", "/account/mfa", "/apps", "/logout", "/error"} {
+	for _, p := range []string{"/login", "/login/mfa", "/login/password", "/register", "/password/forgot", "/password/reset", "/account/mfa", "/apps", "/logout", "/error"} {
 		w := do(r, "GET", p, "", nil)
 		if w.Code != 200 || !strings.Contains(w.Body.String(), "<title>app</title>") {
 			t.Errorf("%s: %d %q", p, w.Code, w.Body.String())

@@ -17,14 +17,14 @@ var appName = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
 // checkUserSettings validates the application name and the JSON object (identity does not look inside).
 func checkUserSettings(app, settings string) error {
 	if !appName.MatchString(app) {
-		return apperror.InvalidArgument("app is not a valid application name")
+		return apperror.InvalidArgument("app is not a valid application name").WithReason("app_name_invalid")
 	}
 	if len(settings) > maxUserSettings {
-		return apperror.InvalidArgument("settings are too large")
+		return apperror.InvalidArgument("settings are too large").WithReason("settings_too_large")
 	}
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(settings), &obj); err != nil || obj == nil {
-		return apperror.InvalidArgument("settings must be a JSON object")
+		return apperror.InvalidArgument("settings must be a JSON object").WithReason("settings_not_object")
 	}
 	return nil
 }
@@ -35,7 +35,7 @@ func (s *Service) GetMyUserSettings(ctx context.Context, req *identityv1.GetMyUs
 		return nil, err
 	}
 	if !appName.MatchString(req.GetApp()) {
-		return nil, apperror.InvalidArgument("app is not a valid application name")
+		return nil, apperror.InvalidArgument("app is not a valid application name").WithReason("app_name_invalid")
 	}
 	out, err := s.Store.UserSettings(ctx, id, req.GetApp())
 	if err != nil {

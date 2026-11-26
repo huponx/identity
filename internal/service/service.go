@@ -33,6 +33,7 @@ var Permissions = map[string]string{
 	"/identity.v1.IdentityService/ListUsers":            "identity:user:read",
 	"/identity.v1.IdentityService/CreateUser":           "identity:user:write",
 	"/identity.v1.IdentityService/SetUserDisabled":      "identity:user:write",
+	"/identity.v1.IdentityService/DeleteUser":           "identity:user:write",
 	"/identity.v1.IdentityService/SetUserPassword":      "identity:user:write",
 	"/identity.v1.IdentityService/SendPasswordReset":    "identity:user:write",
 	"/identity.v1.IdentityService/UpdateUser":           "identity:user:write",
@@ -42,6 +43,11 @@ var Permissions = map[string]string{
 	"/identity.v1.IdentityService/GetMe":                grpcserver.Public,
 	"/identity.v1.IdentityService/UpdateMe":             grpcserver.Public,
 	"/identity.v1.IdentityService/SetMyAvatar":          grpcserver.Public,
+	"/identity.v1.IdentityService/ChangeMyPassword":     grpcserver.Public,
+	"/identity.v1.IdentityService/DisableMyMFA":         grpcserver.Public,
+	"/identity.v1.IdentityService/ConfirmMyMFA":         grpcserver.Public,
+	"/identity.v1.IdentityService/BeginMyMFA":           grpcserver.Public,
+	"/identity.v1.IdentityService/GetMyMFA":             grpcserver.Public,
 	"/identity.v1.IdentityService/GetMyUserSettings":    grpcserver.Public,
 	"/identity.v1.IdentityService/PutMyUserSettings":    grpcserver.Public,
 	"/identity.v1.IdentityService/CreateRole":           "identity:role:write",
@@ -99,24 +105,41 @@ func toErr(err error) error {
 	case errors.Is(err, store.ErrConflict):
 		return apperror.AlreadyExists("already exists")
 	case errors.Is(err, store.ErrUnknownPermission):
-		return apperror.InvalidArgument("a permission is not in the catalog; add it to the permissions first")
+		return apperror.InvalidArgument("a permission is not in the catalog; add it to the permissions first").WithReason("unknown_permission")
 	case errors.Is(err, store.ErrClientNotDisabled):
-		return apperror.FailedPrecondition("disable the client before deleting it")
+		return apperror.FailedPrecondition("disable the client before deleting it").WithReason("client_not_disabled")
+	case errors.Is(err, store.ErrLastAdmin):
+		return apperror.FailedPrecondition("this is the last admin; assign the admin role to another user first").WithReason("last_admin")
 	case errors.Is(err, store.ErrRoleInUse):
-		return apperror.FailedPrecondition("a user or a client still holds this role")
+		return apperror.FailedPrecondition("a user or a client still holds this role").WithReason("role_in_use")
 	case errors.Is(err, store.ErrPermissionInUse):
-		return apperror.FailedPrecondition("a role still holds this permission")
+		return apperror.FailedPrecondition("a role still holds this permission").WithReason("permission_in_use")
+	case errors.Is(err, account.ErrInvalidCredentials):
+		return apperror.InvalidArgument("the current password is wrong").WithReason("wrong_current_password")
+	case errors.Is(err, account.ErrRateLimited):
+		return apperror.Wrap(codes.ResourceExhausted, "too many attempts, try again later", err).WithReason("too_many_attempts")
+	case errors.Is(err, account.ErrInvalidCode):
+		return apperror.InvalidArgument("the code is wrong").WithReason("invalid_mfa_code")
+	case errors.Is(err, account.ErrMFAEnabled):
+		return apperror.FailedPrecondition("multi-factor authentication is already on").WithReason("mfa_already_enabled")
 	case errors.Is(err, account.ErrNotPending):
-		return apperror.FailedPrecondition("the user already has a password")
+		return apperror.FailedPrecondition("the user already has a password").WithReason("password_already_set")
 	case errors.Is(err, account.ErrMFAForced):
-		return apperror.FailedPrecondition("multi-factor authentication is required for this user")
+		return apperror.FailedPrecondition("multi-factor authentication is required for this user").WithReason("mfa_required_for_user")
 	case errors.Is(err, account.ErrMFAOff):
-		return apperror.FailedPrecondition("multi-factor authentication is turned off on this server")
+		return apperror.FailedPrecondition("multi-factor authentication is turned off on this server").WithReason("mfa_disabled_on_server")
 	case errors.Is(err, account.ErrMFANotEnrolled):
-		return apperror.FailedPrecondition("the user has not enrolled a second factor")
-	case errors.Is(err, password.ErrTooShort), errors.Is(err, password.ErrTooLong), errors.Is(err, password.ErrCommon),
-		errors.Is(err, password.ErrSame), errors.Is(err, password.ErrEmail):
-		return apperror.InvalidArgument(err.Error())
+		return apperror.FailedPrecondition("the user has not enrolled a second factor").WithReason("mfa_not_enrolled")
+	case errors.Is(err, password.ErrTooShort):
+		return apperror.InvalidArgument(err.Error()).WithReason("password_too_short")
+	case errors.Is(err, password.ErrTooLong):
+		return apperror.InvalidArgument(err.Error()).WithReason("password_too_long")
+	case errors.Is(err, password.ErrCommon):
+		return apperror.InvalidArgument(err.Error()).WithReason("password_common")
+	case errors.Is(err, password.ErrSame):
+		return apperror.InvalidArgument(err.Error()).WithReason("password_same")
+	case errors.Is(err, password.ErrEmail):
+		return apperror.InvalidArgument(err.Error()).WithReason("password_email")
 	case errors.As(err, &te):
 		return apperror.InvalidArgument(te.Desc)
 	}
@@ -168,7 +191,7 @@ func (s *Service) CheckPermission(ctx context.Context, req *identityv1.CheckPerm
 
 func (s *Service) RevokeToken(ctx context.Context, req *identityv1.RevokeTokenRequest) (*identityv1.RevokeTokenResponse, error) {
 	if req.GetJti() == "" || req.GetTtlSeconds() <= 0 {
-		return nil, apperror.InvalidArgument("jti and ttl_seconds are required")
+		return nil, apperror.InvalidArgument("jti and ttl_seconds are required").WithReason("jti_ttl_required")
 	}
 	if err := s.State.Deny(ctx, req.GetJti(), time.Duration(req.GetTtlSeconds())*time.Second); err != nil {
 		return nil, toErr(err)
@@ -245,7 +268,7 @@ func (s *Service) GetUser(ctx context.Context, req *identityv1.GetUserRequest) (
 	case req.GetEmail() != "":
 		u, err = s.Store.UserByEmail(ctx, req.GetEmail())
 	default:
-		return nil, apperror.InvalidArgument("id or email is required")
+		return nil, apperror.InvalidArgument("id or email is required").WithReason("id_or_email_required")
 	}
 	if err != nil {
 		return nil, toErr(err)
@@ -305,7 +328,7 @@ func (s *Service) ListUsers(ctx context.Context, req *identityv1.ListUsersReques
 func (s *Service) CreateUser(ctx context.Context, req *identityv1.CreateUserRequest) (*identityv1.CreateUserResponse, error) {
 	email := store.NormalizeEmail(req.GetEmail())
 	if !strings.Contains(email, "@") || len(email) > 254 {
-		return nil, apperror.InvalidArgument("a valid email is required")
+		return nil, apperror.InvalidArgument("a valid email is required").WithReason("valid_email_required")
 	}
 	u := store.User{Email: email, Name: req.GetName(), Locale: req.GetLocale()}
 	if pw := req.GetPassword(); pw != "" {
@@ -341,10 +364,10 @@ var locales = map[string]bool{"en": true, "vi": true}
 func (s *Service) UpdateUser(ctx context.Context, req *identityv1.UpdateUserRequest) (*identityv1.UpdateUserResponse, error) {
 	name := strings.TrimSpace(req.GetName())
 	if len([]rune(name)) > 200 {
-		return nil, apperror.InvalidArgument("name is too long")
+		return nil, apperror.InvalidArgument("name is too long").WithReason("name_too_long")
 	}
 	if l := req.GetLocale(); l != "" && !locales[l] {
-		return nil, apperror.InvalidArgument("unsupported locale")
+		return nil, apperror.InvalidArgument("unsupported locale").WithReason("unsupported_locale")
 	}
 	if err := s.Store.UpdateUser(ctx, req.GetUserId(), name, req.GetLocale()); err != nil {
 		return nil, toErr(err)
@@ -395,6 +418,23 @@ func (s *Service) SetUserDisabled(ctx context.Context, req *identityv1.SetUserDi
 	return &identityv1.SetUserDisabledResponse{}, nil
 }
 
+func (s *Service) DeleteUser(ctx context.Context, req *identityv1.DeleteUserRequest) (*identityv1.DeleteUserResponse, error) {
+	if req.GetUserId() == "" {
+		return nil, apperror.InvalidArgument("user_id is required").WithReason("user_id_required")
+	}
+	if p := authn.FromContext(ctx); p != nil && !p.IsService() && p.Subject == req.GetUserId() {
+		return nil, apperror.FailedPrecondition("you cannot delete your own account").WithReason("cannot_delete_self")
+	}
+	if err := s.Store.DeleteUser(ctx, req.GetUserId()); err != nil {
+		return nil, toErr(err)
+	}
+	// after the commit, and on every call: a retry finishes what a failed first call left (idempotent)
+	if err := s.Acct.RevokeUserAccess(ctx, req.GetUserId()); err != nil {
+		return nil, toErr(err)
+	}
+	return &identityv1.DeleteUserResponse{}, nil
+}
+
 func (s *Service) SetUserPassword(ctx context.Context, req *identityv1.SetUserPasswordRequest) (*identityv1.SetUserPasswordResponse, error) {
 	u, err := s.Store.UserByID(ctx, req.GetUserId())
 	if err != nil {
@@ -421,7 +461,7 @@ func (s *Service) SendPasswordReset(ctx context.Context, req *identityv1.SendPas
 
 func validRole(r *identityv1.Role) error {
 	if r == nil || r.GetName() == "" {
-		return apperror.InvalidArgument("role name is required")
+		return apperror.InvalidArgument("role name is required").WithReason("role_name_required")
 	}
 	return validPerms(r.GetPermissions())
 }
@@ -429,7 +469,7 @@ func validRole(r *identityv1.Role) error {
 func validPerms(perms []string) error {
 	for _, p := range perms {
 		if !authz.Valid(p) {
-			return apperror.InvalidArgument("invalid permission " + p)
+			return apperror.InvalidArgument("invalid permission "+p).WithReason("invalid_permission", "name", p)
 		}
 	}
 	return nil
@@ -466,7 +506,7 @@ func (s *Service) SetRolePermissions(ctx context.Context, req *identityv1.SetRol
 
 func (s *Service) UpdateRole(ctx context.Context, req *identityv1.UpdateRoleRequest) (*identityv1.UpdateRoleResponse, error) {
 	if req.GetRole() == "" {
-		return nil, apperror.InvalidArgument("role name is required")
+		return nil, apperror.InvalidArgument("role name is required").WithReason("role_name_required")
 	}
 	if err := validPerms(req.GetPermissions()); err != nil {
 		return nil, err
@@ -483,7 +523,7 @@ func (s *Service) UpdateRole(ctx context.Context, req *identityv1.UpdateRoleRequ
 
 func (s *Service) DeleteRole(ctx context.Context, req *identityv1.DeleteRoleRequest) (*identityv1.DeleteRoleResponse, error) {
 	if req.GetRole() == "" {
-		return nil, apperror.InvalidArgument("role name is required")
+		return nil, apperror.InvalidArgument("role name is required").WithReason("role_name_required")
 	}
 	if err := s.Store.DeleteRole(ctx, req.GetRole()); err != nil {
 		return nil, toErr(err)
@@ -521,7 +561,7 @@ func (s *Service) ListRoles(ctx context.Context, req *identityv1.ListRolesReques
 
 func (s *Service) AssignRole(ctx context.Context, req *identityv1.AssignRoleRequest) (*identityv1.AssignRoleResponse, error) {
 	if (req.GetUserId() == "") == (req.GetClientId() == "") || req.GetRole() == "" {
-		return nil, apperror.InvalidArgument("role and exactly one of user_id and client_id are required")
+		return nil, apperror.InvalidArgument("role and exactly one of user_id and client_id are required").WithReason("role_subject_required")
 	}
 	if err := s.Store.AssignRole(ctx, req.GetUserId(), req.GetClientId(), req.GetRole()); err != nil {
 		return nil, toErr(err)
@@ -531,7 +571,7 @@ func (s *Service) AssignRole(ctx context.Context, req *identityv1.AssignRoleRequ
 
 func (s *Service) RevokeRole(ctx context.Context, req *identityv1.RevokeRoleRequest) (*identityv1.RevokeRoleResponse, error) {
 	if (req.GetUserId() == "") == (req.GetClientId() == "") || req.GetRole() == "" {
-		return nil, apperror.InvalidArgument("role and exactly one of user_id and client_id are required")
+		return nil, apperror.InvalidArgument("role and exactly one of user_id and client_id are required").WithReason("role_subject_required")
 	}
 	if err := s.Store.RevokeRole(ctx, req.GetUserId(), req.GetClientId(), req.GetRole()); err != nil {
 		return nil, toErr(err)
@@ -558,7 +598,7 @@ var knownGrants = map[string]bool{"authorization_code": true, "refresh_token": t
 func (s *Service) CreateClient(ctx context.Context, req *identityv1.CreateClientRequest) (*identityv1.CreateClientResponse, error) {
 	in := req.GetClient()
 	if in.GetClientId() == "" || in.GetResource() == "" {
-		return nil, apperror.InvalidArgument("client_id and resource are required")
+		return nil, apperror.InvalidArgument("client_id and resource are required").WithReason("client_resource_required")
 	}
 	c := store.Client{
 		ClientID: in.GetClientId(), Name: in.GetName(), RedirectURIs: in.GetRedirectUris(), PostLogoutRedirectURIs: in.GetPostLogoutRedirectUris(),
@@ -574,7 +614,7 @@ func (s *Service) CreateClient(ctx context.Context, req *identityv1.CreateClient
 	case identityv1.ClientType_CLIENT_TYPE_CONFIDENTIAL:
 		c.Type = "confidential"
 	default:
-		return nil, apperror.InvalidArgument("type is required")
+		return nil, apperror.InvalidArgument("type is required").WithReason("type_required")
 	}
 	if err := normalizeClient(&c); err != nil {
 		return nil, err
@@ -601,19 +641,19 @@ func normalizeClient(c *store.Client) error {
 	}
 	for _, g := range c.AllowedGrants {
 		if !knownGrants[g] {
-			return apperror.InvalidArgument("unknown grant " + g)
+			return apperror.InvalidArgument("unknown grant "+g).WithReason("unknown_grant", "grant", g)
 		}
 		if c.Type == "public" && g != "authorization_code" && g != "refresh_token" {
-			return apperror.InvalidArgument("a public client cannot use " + g)
+			return apperror.InvalidArgument("a public client cannot use "+g).WithReason("public_client_grant", "grant", g)
 		}
 	}
 	for _, u := range append(append([]string{}, c.RedirectURIs...), c.PostLogoutRedirectURIs...) {
 		if !validURI(u) {
-			return apperror.InvalidArgument("invalid uri " + u)
+			return apperror.InvalidArgument("invalid uri "+u).WithReason("invalid_uri", "uri", u)
 		}
 	}
 	if c.BackchannelLogoutURI != "" && !validURI(c.BackchannelLogoutURI) {
-		return apperror.InvalidArgument("invalid backchannel_logout_uri")
+		return apperror.InvalidArgument("invalid backchannel_logout_uri").WithReason("invalid_backchannel_logout_uri")
 	}
 	return nil
 }
@@ -622,7 +662,7 @@ func normalizeClient(c *store.Client) error {
 // public client still hold.
 func (s *Service) UpdateClient(ctx context.Context, req *identityv1.UpdateClientRequest) (*identityv1.UpdateClientResponse, error) {
 	if req.GetClientId() == "" || req.GetResource() == "" {
-		return nil, apperror.InvalidArgument("client_id and resource are required")
+		return nil, apperror.InvalidArgument("client_id and resource are required").WithReason("client_resource_required")
 	}
 	cur, err := s.Store.ClientByID(ctx, req.GetClientId())
 	if err != nil {
@@ -648,10 +688,10 @@ func (s *Service) UpdateClient(ctx context.Context, req *identityv1.UpdateClient
 
 func (s *Service) SetClientDisabled(ctx context.Context, req *identityv1.SetClientDisabledRequest) (*identityv1.SetClientDisabledResponse, error) {
 	if req.GetClientId() == "" {
-		return nil, apperror.InvalidArgument("client_id is required")
+		return nil, apperror.InvalidArgument("client_id is required").WithReason("client_id_required")
 	}
 	if req.GetDisabled() && s.isCallerClient(ctx, req.GetClientId()) {
-		return nil, apperror.FailedPrecondition("this is the client of your own session")
+		return nil, apperror.FailedPrecondition("this is the client of your own session").WithReason("own_session_client")
 	}
 	c, err := s.Store.SetClientDisabled(ctx, req.GetClientId(), req.GetDisabled())
 	if err != nil {
@@ -662,10 +702,10 @@ func (s *Service) SetClientDisabled(ctx context.Context, req *identityv1.SetClie
 
 func (s *Service) DeleteClient(ctx context.Context, req *identityv1.DeleteClientRequest) (*identityv1.DeleteClientResponse, error) {
 	if req.GetClientId() == "" {
-		return nil, apperror.InvalidArgument("client_id is required")
+		return nil, apperror.InvalidArgument("client_id is required").WithReason("client_id_required")
 	}
 	if s.isCallerClient(ctx, req.GetClientId()) {
-		return nil, apperror.FailedPrecondition("this is the client of your own session")
+		return nil, apperror.FailedPrecondition("this is the client of your own session").WithReason("own_session_client")
 	}
 	if err := s.Store.DeleteClient(ctx, req.GetClientId()); err != nil {
 		return nil, toErr(err)
@@ -741,7 +781,7 @@ func (s *Service) ListClients(ctx context.Context, req *identityv1.ListClientsRe
 func (s *Service) SetExchangePolicy(ctx context.Context, req *identityv1.SetExchangePolicyRequest) (*identityv1.SetExchangePolicyResponse, error) {
 	p := req.GetPolicy()
 	if p.GetClientId() == "" || p.GetAudience() == "" {
-		return nil, apperror.InvalidArgument("client_id and audience are required")
+		return nil, apperror.InvalidArgument("client_id and audience are required").WithReason("client_audience_required")
 	}
 	if req.GetDelete() {
 		if err := s.Store.DeleteExchangePolicy(ctx, p.GetClientId(), p.GetAudience()); err != nil {
@@ -750,7 +790,7 @@ func (s *Service) SetExchangePolicy(ctx context.Context, req *identityv1.SetExch
 		return &identityv1.SetExchangePolicyResponse{}, nil
 	}
 	if d := p.GetMaxChainDepth(); d < 0 || d > 5 {
-		return nil, apperror.InvalidArgument("max_chain_depth must be between 1 and 5")
+		return nil, apperror.InvalidArgument("max_chain_depth must be between 1 and 5").WithReason("max_chain_depth_range")
 	}
 	err := s.Store.SetExchangePolicy(ctx, store.ExchangePolicy{
 		ClientID: p.GetClientId(), Audience: p.GetAudience(), MaxScope: p.GetMaxScope(), MaxChainDepth: int(p.GetMaxChainDepth()),
@@ -819,7 +859,7 @@ func (s *Service) SetUserMFA(ctx context.Context, req *identityv1.SetUserMFARequ
 		if u.MFAEnabled {
 			return &identityv1.SetUserMFAResponse{}, nil
 		}
-		return nil, apperror.FailedPrecondition("the user must enroll an authenticator; use EnforceUserMFA to make it mandatory")
+		return nil, apperror.FailedPrecondition("the user must enroll an authenticator; use EnforceUserMFA to make it mandatory").WithReason("mfa_enroll_first")
 	}
 	if err := s.Acct.AdminDisableMFA(ctx, u); err != nil {
 		return nil, toErr(err)
