@@ -10,7 +10,6 @@ import (
 	"github.com/huponx/identity/internal/password"
 
 	"github.com/huponx/gocommon/authn"
-	"github.com/huponx/gocommon/grpcserver"
 	"github.com/huponx/gocommon/jwtx"
 )
 
@@ -33,7 +32,7 @@ func TestMeID(t *testing.T) {
 		}
 		got, err := meID(ctx)
 		if (err == nil) != c.ok || got != c.want {
-			t.Errorf("%s: got %q, %v", c.name, got, err)
+			t.Errorf("%s: got %+v, %v", c.name, got, err)
 		}
 	}
 }
@@ -41,8 +40,8 @@ func TestMeID(t *testing.T) {
 // The "me" methods need only a signed-in user; every other method of the user API needs a permission.
 func TestMePermissionsArePublic(t *testing.T) {
 	for _, m := range []string{"GetMe", "UpdateMe", "SetMyAvatar", "ChangeMyPassword", "GetMyMFA", "BeginMyMFA", "ConfirmMyMFA", "DisableMyMFA"} {
-		if got := Permissions["/identity.v1.IdentityService/"+m]; got != grpcserver.Public {
-			t.Errorf("%s: %q", m, got)
+		if got := Permissions["/identity.v1.IdentityService/"+m]; !got.Public {
+			t.Errorf("%s: %+v", m, got)
 		}
 	}
 }

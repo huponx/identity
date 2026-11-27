@@ -49,6 +49,10 @@ func TestDeleteUser(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if _, err := s.InsertPasskey(ctx, Passkey{UserID: u.ID, CredentialID: []byte(u.ID), PublicKey: []byte("k"), Name: "Laptop"}); err != nil {
+		t.Fatal(err)
+	}
+
 	if err := s.DeleteUser(ctx, u.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +85,7 @@ func TestDeleteUser(t *testing.T) {
 	if email != u.ID+"@deleted.invalid" || name != "" || !disabled || hash != nil {
 		t.Errorf("row after delete: %q %q %v %v", email, name, disabled, hash)
 	}
-	for _, tb := range []string{"identity_user_roles", "identity_user_settings", "identity_refresh_tokens", "identity_user_mfa_factors", "identity_password_resets"} {
+	for _, tb := range []string{"identity_user_roles", "identity_user_settings", "identity_refresh_tokens", "identity_user_mfa_factors", "identity_user_passkeys", "identity_password_resets"} {
 		var n int
 		if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM `+tb+` WHERE user_id = $1`, u.ID).Scan(&n); err != nil || n != 0 {
 			t.Errorf("%s: %d rows, %v", tb, n, err)

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -24,6 +25,8 @@ var ErrNotFound = errors.New("state: not found")
 type State struct {
 	rdb *redis.Client
 	now func() time.Time
+	// LimitFactor multiplies the maximum of every rate limit (Allow); 0 or 1 leaves them as they are. Local tests only.
+	LimitFactor int64
 }
 
 // New builds a State from a redis:// URL and pings.
@@ -71,7 +74,18 @@ type Session struct {
 	CreatedAt time.Time `json:"created"`
 	// Clients are the OAuth clients that received tokens through this session (for logout).
 	Clients []string `json:"clients,omitempty"`
+	// IP and UserAgent of the request that signed in (UserAgent cut to MaxUserAgent); LastSeen is the last read of
+	// the session, written at most once per LastSeenEvery. Sessions from before they existed have none of them.
+	IP        string    `json:"ip,omitempty"`
+	UserAgent string    `json:"ua,omitempty"`
+	LastSeen  time.Time `json:"seen,omitzero"`
 }
+
+// MaxUserAgent is the longest User-Agent kept.
+const MaxUserAgent = 512
+
+// LastSeenEvery is how often the last activity of a session is written.
+const LastSeenEvery = time.Minute
 
 func sessKey(cookie string) string { return "identity:sess:" + hash(cookie) }
 func sidxKey(pid string) string    { return "identity:sidx:" + pid }
@@ -117,6 +131,12 @@ func (s *State) GetSession(ctx context.Context, cookie string, idle, absolute ti
 	ttl := idle
 	if left < ttl {
 		ttl = left
+	}
+	if now := s.now(); now.Sub(sess.LastSeen) >= LastSeenEvery {
+		sess.LastSeen = now
+		if raw, err := json.Marshal(sess); err == nil { // best effort: a missed write only makes "last active" older
+			_ = s.rdb.SetArgs(ctx, sessKey(cookie), raw, redis.SetArgs{Mode: "XX", KeepTTL: true}).Err()
+		}
 	}
 	if err := s.rdb.Expire(ctx, sessKey(cookie), ttl).Err(); err != nil {
 		return nil, err
@@ -209,6 +229,42 @@ func (s *State) DeleteSession(ctx context.Context, publicID string) (*Session, e
 		return nil, err
 	}
 	return sess, nil
+}
+
+// ListUserSessions returns the live sessions of a user, newest first. Members of the set whose session
+// expired (idle expiry never removes them) are dropped from it.
+func (s *State) ListUserSessions(ctx context.Context, userID string) ([]Session, error) {
+	pids, err := s.rdb.SMembers(ctx, usessKey(userID)).Result()
+	if err != nil {
+		return nil, err
+	}
+	var out []Session
+	for _, pid := range pids {
+		ch, err := s.rdb.Get(ctx, sidxKey(pid)).Result()
+		if err == nil {
+			var raw []byte
+			if raw, err = s.rdb.Get(ctx, "identity:sess:"+ch).Bytes(); err == nil {
+				var sess Session
+				if json.Unmarshal(raw, &sess) == nil && sess.UserID == userID {
+					out = append(out, sess)
+				}
+				continue
+			}
+		}
+		if !errors.Is(err, redis.Nil) {
+			return nil, err
+		}
+		if err := s.rdb.SRem(ctx, usessKey(userID), pid).Err(); err != nil {
+			return nil, err
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+// IsUserSession reports whether the session (by public id) is one of the user's.
+func (s *State) IsUserSession(ctx context.Context, userID, publicID string) (bool, error) {
+	return s.rdb.SIsMember(ctx, usessKey(userID), publicID).Result()
 }
 
 // DeleteUserSessions deletes every session of a user and returns them.
@@ -344,6 +400,50 @@ func (s *State) DeleteChallenge(ctx context.Context, id string) error {
 	return s.rdb.Del(ctx, "identity:mfa:"+hash(id)).Err()
 }
 
+// ---- passkey ceremonies ----
+
+// Purposes of a passkey ceremony. A ceremony begun for one is never accepted for another.
+const (
+	CeremonyLogin    = "login"    // usernameless sign in
+	CeremonyMFA      = "mfa"      // second factor after the password (the id is the id of the MFA challenge)
+	CeremonyRegister = "register" // a new passkey of a signed in user
+)
+
+// Ceremony is the state of a WebAuthn ceremony between its two steps.
+type Ceremony struct {
+	Purpose string          `json:"p"`
+	UserID  string          `json:"u,omitempty"` // "" for the usernameless sign in
+	Data    json.RawMessage `json:"d"`           // the webauthn session data
+}
+
+func ceremonyKey(id string) string { return "identity:wa:" + hash(id) }
+
+// SaveCeremony stores a ceremony under id for 5 minutes (a second save under the same id replaces it).
+func (s *State) SaveCeremony(ctx context.Context, id string, c Ceremony) error {
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	return s.rdb.Set(ctx, ceremonyKey(id), raw, challengeTTL).Err()
+}
+
+// TakeCeremony returns and deletes the ceremony in one step: an answer can be tried once, whether it
+// verifies or not.
+func (s *State) TakeCeremony(ctx context.Context, id string) (*Ceremony, error) {
+	raw, err := s.rdb.GetDel(ctx, ceremonyKey(id)).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	var c Ceremony
+	if err := json.Unmarshal(raw, &c); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
 // ---- denylist, cutoff, rate limit ----
 
 // Deny puts a jti on the denylist for ttl (the remaining life of the token).
@@ -382,6 +482,9 @@ func (s *State) Cutoff(ctx context.Context, userID string) (time.Time, error) {
 // Allow counts one event under key and reports whether it is within max per window.
 // The window starts with the first event (fixed window).
 func (s *State) Allow(ctx context.Context, key string, max int64, window time.Duration) (bool, error) {
+	if s.LimitFactor > 1 {
+		max *= s.LimitFactor
+	}
 	k := "identity:rl:" + key
 	pipe := s.rdb.TxPipeline()
 	incr := pipe.Incr(ctx, k)

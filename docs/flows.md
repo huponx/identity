@@ -40,22 +40,25 @@ Two listeners run in one process:
 | `POST /oauth2/introspect` | `introspect` (`tokens.go`) |
 | `GET, POST /userinfo` | `userinfo` (`tokens.go`) |
 | `GET, POST /oauth2/logout` | `endSession` (`logout.go`) |
-| `GET /login`, `/login/mfa`, `/login/password`, `/register`, `/password/forgot`, `/password/reset`, `/account/mfa`, `/logout`, `/error` | `spa` (`server.go`): `index.html` of the sign in app (`IDENTITY_UI_DIR`); the app routes itself |
+| `GET /login`, `/login/mfa`, `/login/password`, `/register`, `/password/forgot`, `/password/reset`, `/password/set`, `/account/mfa`, `/logout`, `/error` | `spa` (`server.go`): `index.html` of the sign in app (`IDENTITY_UI_DIR`); the app routes itself |
 | `GET /assets/*`, `/logo.svg`, `/theme-init.js` | files of the sign in app (`pages` in `server.go`) |
 | `GET /auth-api/csrf` | `csrfToken`: sets the `csrf` cookie, returns the token |
 | `POST /auth-api/login` | `apiLogin` (`authapi.go`) |
 | `GET, POST /auth-api/login/mfa` | `apiMFACheck`, `apiMFA` |
 | `GET, POST /auth-api/login/password` | `apiPasswordChangeCheck`, `apiPasswordChange`: forced change of a temporary password |
-| `POST /auth-api/register` | `apiRegister`: 404 unless `IDENTITY_REGISTRATION_ENABLED`; `{email, name, locale}`; `account.Register` creates the user (no password) with `IDENTITY_REGISTRATION_ROLE` and sends the welcome mail (`SendWelcome`, link to set the password). The answer is `{}` whether or not the address had an account (nothing is sent to an existing one); only the per-IP limit answers 429 |
+| `POST /auth-api/register` | `apiRegister`: 404 unless `IDENTITY_REGISTRATION_ENABLED`; `{email, name, locale}`; `account.Register` creates the user (no password) with `IDENTITY_REGISTRATION_ROLE`; what follows depends on the setting `registration_requires_approval` (see "Registration" below): the welcome mail at once, or a wait for an administrator. The answer is `{}` whether or not the address had an account (nothing is sent to an existing one); only the per-IP limit answers 429 |
 | `POST /auth-api/password/forgot` | `apiForgot` |
 | `GET, POST /auth-api/password/reset` | `apiResetCheck`, `apiReset` |
 | `GET, POST /auth-api/account/mfa`, `POST /auth-api/account/mfa/disable` | `apiAccountMFA`, `apiAccountMFAConfirm`, `apiAccountMFADisable` |
-| `GET /auth-api/apps` | `apiApps`: the applications of `IDENTITY_APPS`, for the signed in user |
+| `POST /auth-api/passkey/login/begin`, `/auth-api/passkey/login/finish` | `apiPasskeyLoginBegin`, `apiPasskeyLoginFinish` (`authapi_passkey.go`): sign in with a passkey (section 4.5) |
+| `POST /auth-api/login/mfa/passkey/begin`, `/auth-api/login/mfa/passkey/finish` | `apiMFAPasskeyBegin`, `apiMFAPasskeyFinish`: the passkey as the second factor (section 4.5) |
+| `GET /auth-api/account/passkeys`, `POST .../begin`, `POST .../finish`, `PATCH, DELETE .../{id}` | `apiPasskeyList`, `apiPasskeyAddBegin`, `apiPasskeyAddFinish`, `apiPasskeyRename`, `apiPasskeyDelete` (section 8.5) |
+| `GET /auth-api/session` | `apiSession`: 401 without a session, else `{"redirect": IDENTITY_PORTAL_URL}` (the login page's "already signed in" check) |
 | `POST /auth-api/logout` | `apiLogout`: sign out of the confirmation page of `/logout` |
 
-A sign in without a valid `return_to` (the user typed `/login`) ends at `/apps`, the list of the configured applications
-with a link to the MFA page; it is not an MFA step. MFA enrollment comes only when the account must have it (mode `required`
-or enforced for the user), and then continues to `/apps`.
+A sign in without a valid `return_to` (the user typed `/login`) ends at the portal (`IDENTITY_PORTAL_URL`);
+it is not an MFA step. MFA enrollment comes only when the account must have it (mode `required`
+or enforced for the user), and then continues to the portal.
 
 The sign in pages are a React app (`web/apps/auth`, image `auth-ui`), copied into the identity image at `/ui` and served
 from the same origin, so cookies, CSRF and CSP need no cross origin rules. The JSON API answers `{"redirect": "<path>"}`
@@ -72,7 +75,7 @@ Every response goes through `securityHeaders` (no-store, CSP, no referrer) and `
 
 | Data | Store | Key or table |
 | --- | --- | --- |
-| SSO session | Redis | `identity:sess:<hash(cookie)>`, `identity:sidx:<public id>`, `identity:usess:<user id>` |
+| SSO session (with IP, User-Agent, last seen) | Redis | `identity:sess:<hash(cookie)>`, `identity:sidx:<public id>`, `identity:usess:<user id>` |
 | Authorization code (60 s) | Redis | `identity:code:<hash(code)>` |
 | MFA challenge (5 min) | Redis | `identity:mfa:<hash(id)>` |
 | Revoked access token (`jti`) | Redis | `identity:deny:<jti>` |
@@ -280,6 +283,46 @@ sequenceDiagram
 5. Success: `state.DeleteChallenge`. If `Challenge.SessionID == ""` it was a login: `startSession`
    with `amr=[pwd, otp]`. Otherwise it was a step-up: `upgradeSession` adds `otp` to the
    existing session (`state.UpdateSession`, TTL kept). Then redirect to `safeReturn(ReturnTo)`.
+
+### 4.5 Passkeys at login — `authapi_passkey.go`
+
+Usernameless sign in (the "Sign in with a passkey" button, or the passkeys in the autofill list of the e-mail field):
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant I as identity
+    participant R as Redis
+    participant P as Postgres
+
+    B->>I: POST /auth-api/passkey/login/begin (csrf)
+    I->>R: Allow passkey:ip, SaveCeremony(login, 5 min)
+    I-->>B: {c, options} (no allow list, userVerification=required)
+    B->>B: navigator.credentials.get (biometric or PIN)
+    B->>I: POST /auth-api/passkey/login/finish (c, credential, return_to, csrf)
+    I->>R: TakeCeremony(c) (GETDEL: once, purpose must be login)
+    I->>P: user by the user handle, its passkeys
+    I->>I: verify origin, RP ID hash, challenge, UV flag, signature, sign count
+    I->>P: TouchPasskey (sign count, last_used_at)
+    I->>R: CreateSession amr=[hwk|swk, mfa]
+    I-->>B: {redirect: safeReturn(return_to)} + Set-Cookie sid
+```
+
+The finish refuses (`401 invalid_passkey`, the reason is only logged): an unknown credential or user handle, a disabled,
+deleted or awaiting-approval user, a user who must still change the temporary password, a sign count that did not move
+forward (logged as a possible clone), an answer without user verification, a wrong origin or RP ID, and a ceremony of
+another purpose or that was used already. A ceremony is consumed by the first answer, right or wrong. The session
+starts with `startSession` (same as `apiLogin`: new session, `TouchLogin`), but with the `amr` of the passkey and
+without a password or TOTP step.
+
+Passkey as the second factor (`/login/mfa/passkey/begin`, `/finish`): the user signed in with the password, has a passkey
+and MFA is required for them (mode `required` or enforced), or a client asked for `acr_values=mfa`. The ceremony id is the id of the MFA challenge, so it is bound to it; `Attempt(c, 5)` and the `mfa:user:`
+limiter apply to the finish as to a code, and the end is `finishMFA`, shared with `apiMFA`: `startSession` with
+`amr=[pwd, hwk|swk, mfa]` for a login, `upgradeSession` for a step-up. `GET /auth-api/login/mfa` answers
+`{totp, passkey}` so the page shows the code field, the passkey button or both.
+
+`mfaDone(amr)` (`otp` or `mfa`) replaces the old `hasAMR(amr, "otp")` in `authorize` (step 4 and the `acr`) and in the
+refresh grant, so `acr=mfa` and the step-up work the same for both factors.
 
 ### 4.4 Forced password change — `apiPasswordChangeCheck`, `apiPasswordChange` (`authapi.go`)
 
@@ -577,6 +620,22 @@ Used by password change, reset, disabling a user and MFA reset.
    refused by introspection and token exchange. Services that verify locally stop accepting
    them when the token expires (at most the access token lifetime).
 
+### 7.4 Sessions of a device — `account/sessions.go`
+
+`startSession` (`oauth/authorize.go`, the one place every sign in creates a session) stores `IP` (`c.ClientIP()`),
+`UserAgent` (512 bytes at most) and `LastSeen`. `state.GetSession` rewrites `LastSeen` when it is older than a minute
+(`SET XX KEEPTTL`).
+
+- `state.ListUserSessions`: `SMEMBERS identity:usess:<uid>`, then `sidx` and the session of each; a member whose session
+  expired idle is `SREM`-ed (idle expiry never cleans the set).
+- `account.ListSessions` / `EndUserSession(uid, pid)` (checks `IsUserSession`, else `ErrSessionNotFound`, then `EndSession`)
+  / `EndOtherSessions(uid, keep)` (one `EndSession` each).
+- `service/sessions.go`: `ListMySessions`, `RevokeMySession`, `RevokeMyOtherSessions` take the user from the token and mark
+  `current` with `Principal.SessionID`; `ListUserSessions` and `RevokeUserSessions` (which is `RevokeUserAccess`, 7.3) are
+  the administrator's.
+
+An access token already issued is not recalled by ending one session (see `README.md`, "Active sessions").
+
 ## 8. Account flows (HTML pages)
 
 ### 8.1 Password reset
@@ -678,13 +737,30 @@ flowchart TD
 | `IDENTITY_MFA_MODE` | User has MFA | User is enforced | Result at login |
 | --- | --- | --- | --- |
 | `off` | any | any | `NoMFA` |
-| any other | yes | any | `Verify` |
-| `required` | no | any | `Enroll` |
-| `optional` | no | yes | `Enroll` |
-| `optional` | no | no | `NoMFA` |
+| any other | TOTP | any | `Verify` |
+| `required` | no TOTP, has a passkey | any | `Verify` (the passkey) |
+| `required` | none | any | `Enroll` |
+| `optional` | no TOTP, has a passkey | yes | `Verify` (the passkey) |
+| `optional` | none | yes | `Enroll` |
+| `optional` | no TOTP | no | `NoMFA` (a passkey is not asked for) |
+
+A passkey is a second factor only when MFA is required; otherwise it is a way in of its own, and a password sign in stays
+a password sign in. A passkey login needs no step at all: its session already has `mfa` in the `amr`. `authorize` with
+`acr_values=mfa` asks a user who has a TOTP device or a passkey for it (`MFAMethods`), others are sent to enroll.
 
 A client can also ask for MFA with `acr_values=mfa`; `authorize` then asks for the code if the
-session has no `otp` in its `amr`.
+session has neither `otp` nor `mfa` (a passkey) in its `amr`.
+
+### 8.5 Passkeys of the signed in user — `account/passkeys.go`
+
+`GET /auth-api/account/passkeys` lists them. `POST .../begin` takes the **current password** (`checkPassword`: 5 failures
+per 15 minutes per user, like `DisableMFA`) and returns `{c, options}` for `navigator.credentials.create` (resident key
+and user verification required, no attestation, the passkeys the user has excluded); `POST .../finish {c, credential, name}`
+consumes the ceremony (purpose `register`, bound to the user), verifies the credential, stores it (the credential id is
+unique across users) and mails `passkey_added`. At most 20 per user. `PATCH .../{id}` renames; `DELETE .../{id}` needs the
+password again and mails `passkey_removed`. The portal does the same through gRPC (`ListMyPasskeys`, `BeginMyPasskey`,
+`FinishMyPasskey`, `RenameMyPasskey`, `DeleteMyPasskey`); the browser runs the ceremony on the portal's origin, which must be
+in `IDENTITY_WEBAUTHN_ORIGINS` and covered by the RP ID. `AdminResetMFA` deletes the passkeys with the TOTP factor.
 
 ## 9. gRPC administration API — `internal/service/service.go`
 
@@ -707,7 +783,8 @@ anything else → Internal without details).
 | `UpdateUser` | `identity:user:write` | name, locale (`en`, `vi`) and theme (`light`, `dark`, `system`; `identity_users.theme`, V12) |
 | `SetUserAvatar` | `identity:user:write` | png/jpeg/webp, at most 64 KiB and 512x512, stored as `bytea`; `GetUser` returns it as a data URI |
 | `ListPermissions` | `identity:permission:read` | the catalog of permissions, with how many roles hold each; paged by token (see below) |
-| `CreatePermission`, `UpdatePermission`, `DeletePermission` | `identity:permission:write` | roles can only hold catalog permissions (FK `identity_role_permissions_permission_fkey`); a permission held by a role cannot be deleted |
+| `ListPermissions` | `identity:permission:read` | the catalog (read only) plus the generated wildcards; services declare permissions in code and identity saves them at start |
+| `RegisterPermissions` | `identity:permission:register` | a service syncs its permissions at start (namespace of its client's `resource` only); a removed permission that a role holds is retired, never cascaded |
 | `GetUserStats` | `identity:user:read` | counts by status, plus `created_this_month` (UTC) (active/pending/disabled), MFA, avatar, activity |
 | `GetMe`, `UpdateMe`, `SetMyAvatar`, `ChangeMyPassword`, `GetMyMFA`, `BeginMyMFA`, `ConfirmMyMFA`, `DisableMyMFA` | any user token (`grpcserver.Public`) | the user is the token subject (`meID`), never a request field; service tokens are refused; `UpdateMe` keeps empty fields; `ChangeMyPassword` checks the current password (limited to 5 failures per 15 minutes per user), applies the policy and, like `SetUserPassword`, ends every session and token of the user, the caller's too; the MFA methods call `BeginEnrollment`, `ConfirmEnrollment` and `DisableMFA` of `account` (the same steps and limits as the account page of the sign in app; `BeginMyMFA` creates the pending enrollment of a user who has none; `GetMyMFA` only reads the status) |
 | `SendWelcome` | `identity:user:write` | `account.SendWelcome`: set-password link valid 7 days, only while the user has no password |
@@ -1001,3 +1078,28 @@ add an upstream, routes and an exchange policy (an exchange policy `gatekeeper -
 | Early deny | gatekeeper `Principal.Can(route.Permission)`; identity checks again with `service.Permissions` |
 | One refresh at a time | gatekeeper `session.Store.Lock`, so refresh token reuse detection is not triggered |
 | Sessions end on logout events | gatekeeper `backchannelLogout` with the indexes `gk:sid:` and `gk:sub:` |
+
+## Registration
+
+`POST /auth-api/register` (only with `IDENTITY_REGISTRATION_ENABLED`; off answers 404) creates a user without a password.
+The system setting `registration_requires_approval` (table `identity_system_settings`; Admin → System settings →
+Registration, RPCs `Get/SetRegistrationSettings`; default **true** when no row exists) decides what happens next:
+
+- **Off:** `SendWelcome` mails the set-password link at once; the user sets a password and is active.
+- **On:** the user is stored with `pending_approval = true` (status `USER_STATUS_PENDING_APPROVAL`, filter
+  `awaiting_approval` in the Users list). No link is sent. The applicant gets `identity_registration_received`; every
+  non-disabled user whose roles hold `identity:user:approve` (the `admin` role through `*`, and `user_approver`) gets
+  `identity_registration_pending` (applicant name and e-mail, a link to `IDENTITY_ADMIN_URL` when set).
+  - **Approve** (`ApproveUser`, `POST /api/users/{id}/approve`): `ApproveRegistration` clears the flag and calls
+    `SendWelcome` (`identity_welcome`, the set-password link); the user sets a password. Status then follows the usual
+    rule (pending until the password is set, then active).
+  - **Reject** (`RejectUser`, `POST /api/users/{id}/reject`): `RejectRegistration` soft-deletes the user (the e-mail is
+    freed, so the address can register again) and mails `identity_registration_rejected`.
+
+A welcome link is a reset token, so the approval state also blocks the other ways to a password: `RequestReset` (forgot
+password) sends nothing to a user awaiting approval, `ResetTokenUser`/`CompleteReset` treat a token of such a user as
+invalid, and `SendWelcome`/`SendReset` (admin API) fail with reason `awaiting_approval`. Only approval lifts it.
+
+**Roles.** `user_approver` (migration V37) holds `identity:user:approve` and `identity:user:read` only: it opens the Users
+page read-only, sees who waits, and approves or rejects; it cannot edit users or settings. The setting itself needs
+`identity:settings:read` / `identity:settings:write`. Locally courier writes all of these mails to `.local/mails/`.

@@ -20,10 +20,9 @@ import (
 var (
 	ErrNotFound = errors.New("store: not found")
 	ErrConflict = errors.New("store: already exists")
-	// ErrUnknownPermission: a role was given a permission that is not in the catalog.
+	// ErrUnknownPermission: a role was given a permission that is neither in the catalog nor a generated wildcard
+	// (the service checks; the roles table has no foreign key to the catalog).
 	ErrUnknownPermission = errors.New("store: permission is not in the catalog")
-	// ErrPermissionInUse: the permission is held by a role and cannot be deleted.
-	ErrPermissionInUse = errors.New("store: permission is held by a role")
 	// ErrRoleInUse: the role is held by a user or a client and cannot be deleted.
 	ErrRoleInUse = errors.New("store: role is held by a user or a client")
 	// ErrClientNotDisabled: only a disabled client can be deleted.
@@ -69,9 +68,6 @@ func mapErr(err error) error {
 		case "23505": // unique_violation
 			return ErrConflict
 		case "23503": // foreign_key_violation: the referenced row does not exist
-			if pg.ConstraintName == "identity_role_permissions_permission_fkey" {
-				return ErrUnknownPermission
-			}
 			return ErrNotFound
 		}
 	}
@@ -97,13 +93,15 @@ type User struct {
 	HasAvatar          bool       // the picture itself is read with UserAvatar
 	LastLoginAt        *time.Time // nil: never signed in (or before sign ins were tracked)
 	Theme              string     // light, dark or system; "" until the user chose one
+	// PendingApproval: a self-registered user an administrator has not approved yet; no mail or reset link works for them.
+	PendingApproval bool
 }
 
-const userCols = `id::text, email, name, locale, coalesce(password_hash, ''), password_changed_at, disabled, mfa_enabled, mfa_enforced, must_change_password, created_at, avatar IS NOT NULL, last_login_at, coalesce(theme, '')`
+const userCols = `id::text, email, name, locale, coalesce(password_hash, ''), password_changed_at, disabled, mfa_enabled, mfa_enforced, must_change_password, created_at, avatar IS NOT NULL, last_login_at, coalesce(theme, ''), pending_approval`
 
 func scanUser(row pgx.Row) (*User, error) {
 	var u User
-	err := row.Scan(&u.ID, &u.Email, &u.Name, &u.Locale, &u.PasswordHash, &u.PasswordChangedAt, &u.Disabled, &u.MFAEnabled, &u.MFAEnforced, &u.MustChangePassword, &u.CreatedAt, &u.HasAvatar, &u.LastLoginAt, &u.Theme)
+	err := row.Scan(&u.ID, &u.Email, &u.Name, &u.Locale, &u.PasswordHash, &u.PasswordChangedAt, &u.Disabled, &u.MFAEnabled, &u.MFAEnforced, &u.MustChangePassword, &u.CreatedAt, &u.HasAvatar, &u.LastLoginAt, &u.Theme, &u.PendingApproval)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -129,8 +127,8 @@ func (s *Store) CreateUser(ctx context.Context, u User, roles []string) (*User, 
 	if u.PasswordHash != "" {
 		pw, changed = u.PasswordHash, time.Now()
 	}
-	row := tx.QueryRow(ctx, `INSERT INTO identity_users (email, name, locale, password_hash, password_changed_at, must_change_password)
-		VALUES ($1, $2, $3, $4, $5, $6) RETURNING `+userCols, NormalizeEmail(u.Email), u.Name, u.Locale, pw, changed, u.MustChangePassword)
+	row := tx.QueryRow(ctx, `INSERT INTO identity_users (email, name, locale, password_hash, password_changed_at, must_change_password, pending_approval)
+		VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING `+userCols, NormalizeEmail(u.Email), u.Name, u.Locale, pw, changed, u.MustChangePassword, u.PendingApproval)
 	created, err := scanUser(row)
 	if err != nil {
 		return nil, err
@@ -154,6 +152,39 @@ func (s *Store) UserByID(ctx context.Context, id string) (*User, error) {
 // UserByEmail returns the user.
 func (s *Store) UserByEmail(ctx context.Context, email string) (*User, error) {
 	return scanUser(s.pool.QueryRow(ctx, `SELECT `+userCols+` FROM identity_users WHERE email = $1 AND deleted_at IS NULL`, NormalizeEmail(email)))
+}
+
+// ApproveUser clears the approval flag of a self-registered user and returns the user. It is ErrNotFound for an
+// unknown user and for one that is not awaiting approval.
+func (s *Store) ApproveUser(ctx context.Context, id string) (*User, error) {
+	if _, err := uuid.Parse(id); err != nil {
+		return nil, ErrNotFound
+	}
+	return scanUser(s.pool.QueryRow(ctx, `UPDATE identity_users SET pending_approval = false
+		WHERE id = $1 AND deleted_at IS NULL AND pending_approval RETURNING `+userCols, id))
+}
+
+// ListUsersWithPermission returns the users who may use the permission through a role (the wildcard "*" counts),
+// without the disabled and the deleted ones, ordered by email.
+func (s *Store) ListUsersWithPermission(ctx context.Context, permission string) ([]User, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+userCols+` FROM identity_users
+		WHERE deleted_at IS NULL AND NOT disabled AND EXISTS (
+			SELECT 1 FROM identity_user_roles ur JOIN identity_role_permissions rp ON rp.role = ur.role
+			WHERE ur.user_id = identity_users.id AND rp.permission IN ($1, '*'))
+		ORDER BY email`, permission)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+	var out []User
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *u)
+	}
+	return out, mapErr(rows.Err())
 }
 
 func (s *Store) execUser(ctx context.Context, id, sql string, args ...any) error {
@@ -212,6 +243,7 @@ func (s *Store) DeleteUser(ctx context.Context, id string) error {
 		`DELETE FROM identity_refresh_tokens WHERE user_id = $1`,
 		`DELETE FROM identity_user_mfa_factors WHERE user_id = $1`,
 		`DELETE FROM identity_mfa_recovery_codes WHERE user_id = $1`,
+		`DELETE FROM identity_user_passkeys WHERE user_id = $1`,
 		`DELETE FROM identity_password_resets WHERE user_id = $1`,
 		`DELETE FROM identity_user_settings WHERE user_id = $1`,
 	} {
@@ -282,10 +314,12 @@ func (s *Store) UserRoles(ctx context.Context, id string) ([]string, error) {
 	return s.strings(ctx, `SELECT role FROM identity_user_roles WHERE user_id = $1 ORDER BY role`, id)
 }
 
-// UserPermissions is the union of the permissions of the roles of a user.
+// UserPermissions is the union of the permissions of the roles of a user, without the retired ones (a permission
+// that no service declares any more is enforced by nothing, so it stays out of the tokens).
 func (s *Store) UserPermissions(ctx context.Context, id string) ([]string, error) {
 	return s.strings(ctx, `SELECT DISTINCT p.permission FROM identity_user_roles ur
-		JOIN identity_role_permissions p ON p.role = ur.role WHERE ur.user_id = $1 ORDER BY 1`, id)
+		JOIN identity_role_permissions p ON p.role = ur.role WHERE ur.user_id = $1
+		AND NOT EXISTS (SELECT 1 FROM identity_permissions c WHERE c.permission = p.permission AND c.retired_at IS NOT NULL) ORDER BY 1`, id)
 }
 
 func (s *Store) strings(ctx context.Context, sql string, args ...any) ([]string, error) {
@@ -546,10 +580,23 @@ func (s *Store) SetClientConfig(ctx context.Context, id string, redirects, logou
 	return nil
 }
 
-// ClientPermissions is the union of the permissions of the roles of a client.
+// SetClientBackchannelLogout sets the back-channel logout address of an existing client ("" turns it off).
+func (s *Store) SetClientBackchannelLogout(ctx context.Context, id, uri string) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE identity_clients SET backchannel_logout_uri = $2, updated_at = now() WHERE client_id = $1`, id, uri)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ClientPermissions is the union of the permissions of the roles of a client, without the retired ones.
 func (s *Store) ClientPermissions(ctx context.Context, id string) ([]string, error) {
 	return s.strings(ctx, `SELECT DISTINCT p.permission FROM identity_client_roles cr
-		JOIN identity_role_permissions p ON p.role = cr.role WHERE cr.client_id = $1 ORDER BY 1`, id)
+		JOIN identity_role_permissions p ON p.role = cr.role WHERE cr.client_id = $1
+		AND NOT EXISTS (SELECT 1 FROM identity_permissions c WHERE c.permission = p.permission AND c.retired_at IS NOT NULL) ORDER BY 1`, id)
 }
 
 // ---- roles ----

@@ -44,6 +44,10 @@ func (f *fakeStore) SetClientConfig(_ context.Context, id string, r, l, g, s []s
 	f.configSet++
 	return nil
 }
+func (f *fakeStore) SetClientBackchannelLogout(_ context.Context, id, uri string) error {
+	f.clients[id].BackchannelLogoutURI = uri
+	return nil
+}
 func (f *fakeStore) SetClientSecret(_ context.Context, id, h string) error {
 	f.clients[id].SecretHash = h
 	return nil
@@ -208,5 +212,33 @@ func TestParse(t *testing.T) {
 		} else if strings.Contains(err.Error(), "s3cret") {
 			t.Errorf("%s: error leaks a secret", name)
 		}
+	}
+}
+
+func TestBackchannelLogoutAddressIsReconciled(t *testing.T) {
+	f := newFake()
+	env := map[string]string{"GK_SECRET": "s3cret-one"}
+	// created without an address, as before the option was configured
+	if err := run(t, f, Config{Clients: []Client{gatekeeper()}}, "", env); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.clients["gatekeeper"].BackchannelLogoutURI; got != "" {
+		t.Fatalf("address after create: %q", got)
+	}
+	// a later run with an address sets it on the existing client
+	g := gatekeeper()
+	g.BackchannelLogoutURI = "http://localhost:8081/auth/backchannel-logout"
+	if err := run(t, f, Config{Clients: []Client{g}}, "", env); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.clients["gatekeeper"].BackchannelLogoutURI; got != g.BackchannelLogoutURI {
+		t.Fatalf("address after reconcile: %q", got)
+	}
+	// a run without one leaves it alone
+	if err := run(t, f, Config{Clients: []Client{gatekeeper()}}, "", env); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.clients["gatekeeper"].BackchannelLogoutURI; got != g.BackchannelLogoutURI {
+		t.Fatalf("address after a run without one: %q", got)
 	}
 }
