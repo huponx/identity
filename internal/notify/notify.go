@@ -230,7 +230,9 @@ func Build(ctx context.Context, cfg appconfig.Identity, log *zap.Logger) Notifie
 		}
 		return None{Logger: log}
 	}
-	client, _, err := notifyclient.Dial(ctx, notifyclient.DialConfig{Target: cfg.CourierTarget, TokenFile: cfg.CourierTokenFile, Logger: log})
+	client, _, err := notifyclient.Dial(ctx, notifyclient.DialConfig{
+		Target: cfg.CourierTarget, TokenFile: cfg.CourierTokenFile, Logger: log, Secure: !cfg.CourierInsecure, TLS: cfg.ClientTLS(),
+	})
 	if err != nil {
 		log.Fatal("courier", zap.Error(err))
 	}

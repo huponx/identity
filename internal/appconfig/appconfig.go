@@ -24,6 +24,9 @@ type Identity struct {
 	config.Log
 	config.Postgres
 	config.Redis
+	// GRPCTLS: the certificate identity serves gRPC with (GRPC_TLS_CERT_FILE/KEY_FILE) and the CA it trusts when it
+	// dials courier securely (GRPC_TLS_CA_FILE).
+	config.GRPCTLS
 
 	Host            string        `env:"HOST" envDefault:"0.0.0.0"`
 	GRPCPort        int           `env:"PORT" envDefault:"9090"`
@@ -65,6 +68,8 @@ type Identity struct {
 	// courier); a local courier does not authenticate services, so a local run sets none.
 	CourierTarget    string `env:"COURIER_TARGET"`
 	CourierTokenFile string `env:"COURIER_TOKEN_FILE"`
+	// CourierInsecure dials courier without TLS, the default. Set false once courier serves TLS (the CA is GRPC_TLS_CA_FILE).
+	CourierInsecure bool `env:"COURIER_INSECURE" envDefault:"true"`
 
 	// TrustedProxies are the CIDRs of the proxies whose forwarded client address is believed
 	// (the ingress controller). Empty: the connection address is used, which is safe but makes the
