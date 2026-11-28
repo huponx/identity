@@ -3,8 +3,6 @@ package service
 import (
 	"strings"
 	"testing"
-
-	"github.com/huponx/gocommon/grpcserver"
 )
 
 func TestCheckUserSettings(t *testing.T) {
@@ -35,8 +33,8 @@ func TestCheckUserSettings(t *testing.T) {
 // The settings methods work on the signed-in user, like the other "me" methods.
 func TestUserSettingsPermissionsArePublic(t *testing.T) {
 	for _, m := range []string{"GetMyUserSettings", "PutMyUserSettings"} {
-		if got := Permissions["/identity.v1.IdentityService/"+m]; got != grpcserver.Public {
-			t.Errorf("%s: %q", m, got)
+		if got := Permissions["/identity.v1.IdentityService/"+m]; !got.Public {
+			t.Errorf("%s: %+v", m, got)
 		}
 	}
 }

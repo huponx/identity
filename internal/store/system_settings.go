@@ -75,3 +75,20 @@ func (s *Store) UIPalettes(ctx context.Context) (map[string]string, error) {
 	}
 	return out, nil
 }
+
+// RegistrationApprovalKey is the key of "self-registration needs the approval of an administrator" in identity_system_settings.
+const RegistrationApprovalKey = "registration_requires_approval"
+
+// RegistrationRequiresApproval reports whether a self-registered user waits for an administrator (true when no row
+// is stored or the stored value is not a boolean).
+func (s *Store) RegistrationRequiresApproval(ctx context.Context) (bool, error) {
+	rows, err := s.SystemSettings(ctx)
+	if err != nil {
+		return false, err
+	}
+	var v bool
+	if raw, ok := rows[RegistrationApprovalKey]; ok && json.Unmarshal(raw, &v) == nil {
+		return v, nil
+	}
+	return true, nil
+}

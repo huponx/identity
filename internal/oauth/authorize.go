@@ -81,6 +81,10 @@ func hasAMR(amr []string, m string) bool {
 	return false
 }
 
+// mfaDone reports that the session passed a second factor: a TOTP or recovery code ("otp") or a passkey with user
+// verification ("mfa", next to "swk" or "hwk"). acr=mfa is derived from it.
+func mfaDone(amr []string) bool { return hasAMR(amr, "otp") || hasAMR(amr, "mfa") }
+
 // redirectErr sends an authorization error back to the client (only after redirect_uri was
 // validated against the client).
 func redirectErr(c *gin.Context, redirectURI, state, code, desc, iss string) {
@@ -190,15 +194,25 @@ func (s *Server) authorize(c *gin.Context) {
 	}
 
 	// 4. second factor
-	req := s.acct.MFARequirement(user)
-	needOTP := (req != account.NoMFA || wantMFA) && !hasAMR(sess.AMR, "otp")
+	req, err := s.acct.MFARequirement(ctx, user)
+	if err != nil {
+		s.fail(c, err)
+		return
+	}
+	needOTP := (req != account.NoMFA || wantMFA) && !mfaDone(sess.AMR)
 	if needOTP {
 		if prompt == "none" {
 			fail("interaction_required", "")
 			return
 		}
 		ret := "/oauth2/authorize?" + q.Encode()
-		if user.MFAEnabled {
+		// a user with a second factor (a TOTP device or a passkey) is asked for it; one without is sent to enroll
+		totp, passkeys, err := s.acct.MFAMethods(ctx, user)
+		if err != nil {
+			s.fail(c, err)
+			return
+		}
+		if req == account.Verify || totp || passkeys {
 			id := password.Random(24)
 			if err := s.state.SaveChallenge(ctx, id, state.Challenge{UserID: user.ID, ReturnTo: ret, SessionID: sess.PublicID, AMR: sess.AMR}); err != nil {
 				s.fail(c, err)
@@ -214,7 +228,7 @@ func (s *Server) authorize(c *gin.Context) {
 	// 5. issue the code
 	code := password.Random(32)
 	acr := ""
-	if hasAMR(sess.AMR, "otp") {
+	if mfaDone(sess.AMR) {
 		acr = "mfa"
 	}
 	if err := s.state.SaveCode(ctx, code, state.AuthCode{
@@ -250,7 +264,11 @@ func (s *Server) fail(c *gin.Context, err error) {
 // address the browser goes to next.
 func (s *Server) continueLogin(c *gin.Context, user *store.User, ret string) (string, error) {
 	ctx := c.Request.Context()
-	switch s.acct.MFARequirement(user) {
+	req, err := s.acct.MFARequirement(ctx, user)
+	if err != nil {
+		return "", err
+	}
+	switch req {
 	case account.Verify:
 		id := password.Random(24)
 		if err := s.state.SaveChallenge(ctx, id, state.Challenge{UserID: user.ID, ReturnTo: ret, AMR: []string{"pwd"}}); err != nil {
@@ -273,7 +291,12 @@ func (s *Server) continueLogin(c *gin.Context, user *store.User, ret string) (st
 // startSession creates an SSO session and sets its cookie.
 func (s *Server) startSession(c *gin.Context, userID string, amr []string) error {
 	cookie := password.Random(32)
-	err := s.state.CreateSession(c.Request.Context(), state.Session{UserID: userID, AuthTime: s.now(), AMR: amr},
+	ua := c.GetHeader("User-Agent")
+	if len(ua) > state.MaxUserAgent {
+		ua = strings.ToValidUTF8(ua[:state.MaxUserAgent], "")
+	}
+	err := s.state.CreateSession(c.Request.Context(),
+		state.Session{UserID: userID, AuthTime: s.now(), AMR: amr, IP: c.ClientIP(), UserAgent: ua, LastSeen: s.now()},
 		cookie, password.Random(18), s.cfg.SessionIdle, s.cfg.SessionAbsolute)
 	if err != nil {
 		return err
@@ -287,15 +310,17 @@ func (s *Server) startSession(c *gin.Context, userID string, amr []string) error
 	return nil
 }
 
-// upgradeSession adds the otp method to the current session.
-func (s *Server) upgradeSession(c *gin.Context) error {
+// upgradeSession adds the methods of a second factor to the current session ("otp"; "swk" or "hwk" and "mfa" for a passkey).
+func (s *Server) upgradeSession(c *gin.Context, methods ...string) error {
 	cookie := s.cookie(c, "sid")
 	sess, err := s.state.GetSession(c.Request.Context(), cookie, s.cfg.SessionIdle, s.cfg.SessionAbsolute)
 	if err != nil {
 		return err
 	}
-	if !hasAMR(sess.AMR, "otp") {
-		sess.AMR = append(sess.AMR, "otp")
+	for _, m := range methods {
+		if !hasAMR(sess.AMR, m) {
+			sess.AMR = append(sess.AMR, m)
+		}
 	}
 	return s.state.UpdateSession(c.Request.Context(), cookie, *sess)
 }

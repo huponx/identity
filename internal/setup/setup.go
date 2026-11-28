@@ -107,6 +107,7 @@ type Store interface {
 	ClientByID(ctx context.Context, id string) (*store.Client, error)
 	CreateClient(ctx context.Context, c store.Client) (*store.Client, error)
 	SetClientConfig(ctx context.Context, id string, redirects, logouts, grants, scopes []string) error
+	SetClientBackchannelLogout(ctx context.Context, id, uri string) error
 	SetClientSecret(ctx context.Context, id, hash string) error
 	AssignRole(ctx context.Context, userID, clientID, role string) error
 	SetExchangePolicy(ctx context.Context, p store.ExchangePolicy) error
@@ -211,6 +212,13 @@ func runClient(ctx context.Context, st Store, want Client, env Env, logf func(st
 			return err
 		}
 		logf("client %s: URIs, grants or scopes added", want.ID)
+	}
+	// unlike the lists above it is one value: a configured address replaces the stored one, no address leaves it alone
+	if want.BackchannelLogoutURI != "" && want.BackchannelLogoutURI != have.BackchannelLogoutURI {
+		if err := st.SetClientBackchannelLogout(ctx, want.ID, want.BackchannelLogoutURI); err != nil {
+			return err
+		}
+		logf("client %s: back-channel logout address set", want.ID)
 	}
 	for _, r := range want.Roles {
 		if !contains(have.Roles, r) {

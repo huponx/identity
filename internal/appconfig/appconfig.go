@@ -54,20 +54,17 @@ type Identity struct {
 	// MFAKeys seal the TOTP secrets: "id:base64key" (32 bytes), comma separated, the first one
 	// seals new secrets, the others only open old ones (key rotation).
 	MFAKeys []string `env:"IDENTITY_MFA_KEY" envSeparator:","`
-	// MFAIssuerName is the label shown in authenticator apps.
+	// MFAIssuerName is the label shown in authenticator apps; it is also the name at the top of every e-mail.
 	MFAIssuerName string `env:"IDENTITY_MFA_ISSUER_NAME" envDefault:"Example"`
 
 	// AuthAudience is the aud of the tokens allowed to call the gRPC API.
 	AuthAudience string `env:"IDENTITY_AUTH_AUDIENCE" envDefault:"identity"`
-	// S2SToken is an optional static Bearer token for the gRPC API, read only when ENV=local.
-	S2SToken string `env:"IDENTITY_S2S_TOKEN"`
 
 	// CourierTarget is the courier gRPC address; empty disables e-mails (the links are logged
 	// when ENV=local). CourierTokenFile is the projected ServiceAccount token (audience
-	// courier); CourierToken is a static token for local runs.
+	// courier); a local courier does not authenticate services, so a local run sets none.
 	CourierTarget    string `env:"COURIER_TARGET"`
 	CourierTokenFile string `env:"COURIER_TOKEN_FILE"`
-	CourierToken     string `env:"COURIER_S2S_TOKEN"`
 
 	// TrustedProxies are the CIDRs of the proxies whose forwarded client address is believed
 	// (the ingress controller). Empty: the connection address is used, which is safe but makes the
@@ -85,37 +82,103 @@ type Identity struct {
 	// the service does not start without it; locally the page paths answer 503 and a warning is logged.
 	UIDir string `env:"IDENTITY_UI_DIR" envDefault:"/ui"`
 
-	// Apps are the applications listed on /apps, the page a user lands on after signing in at identity itself
-	// (no application sent them): "Name=https://url" entries, separated by commas or new lines, each with an optional icon
-	// "Name=https://url|https://icon.example/logo.svg".
-	Apps []string `env:"IDENTITY_APPS" envSeparator:","`
+	// PortalURL is where a user lands after signing in at identity itself (no application sent them).
+	PortalURL string `env:"IDENTITY_PORTAL_URL,required"`
+
+	// RateLimitFactor multiplies the maximum of every rate limit (login, registration, password reset, MFA), for tests that
+	// repeat an action many times. Only with ENV=local: anywhere else a value above 1 stops the service from starting.
+	RateLimitFactor int64 `env:"IDENTITY_RATE_LIMIT_FACTOR" envDefault:"1"`
+
+	// AdminURL is the admin app, the mail to the users who approve registrations links to {AdminURL}/users/{id} of the applicant; empty omits the link.
+	AdminURL string `env:"IDENTITY_ADMIN_URL"`
+
+	// WebAuthnEnabled turns passkeys on; off, their endpoints answer 404 and the sign in pages hide them.
+	WebAuthnEnabled bool `env:"IDENTITY_WEBAUTHN_ENABLED" envDefault:"true"`
+	// WebAuthnRPID is the relying party id, a registrable suffix of every origin that runs a passkey ceremony
+	// (empty: the host of the issuer). It is bound into every passkey: changing it later makes all of them unusable.
+	WebAuthnRPID string `env:"IDENTITY_WEBAUTHN_RP_ID"`
+	// WebAuthnRPName is the name the authenticator shows (empty: IDENTITY_MFA_ISSUER_NAME).
+	WebAuthnRPName string `env:"IDENTITY_WEBAUTHN_RP_NAME"`
+	// WebAuthnOrigins are the origins allowed to run a ceremony (empty: the issuer, the portal and the admin app).
+	WebAuthnOrigins []string `env:"IDENTITY_WEBAUTHN_ORIGINS" envSeparator:","`
 }
 
-// AppLink is an application of the /apps page.
-type AppLink struct {
-	Name string `json:"name"`
-	URL  string `json:"url"`
-	Icon string `json:"icon,omitempty"`
+// origin is scheme://host of a URL, "" when it is not one.
+func origin(u string) string {
+	p, err := url.Parse(u)
+	if err != nil || p.Host == "" {
+		return ""
+	}
+	return p.Scheme + "://" + p.Host
 }
 
-// IconOrigins are the origins the sign in pages may load the icons from (the img-src of the CSP).
-func IconOrigins(apps []AppLink) []string {
-	seen := map[string]bool{}
+// WebAuthnRP returns the relying party id, with its default.
+func (c Identity) WebAuthnRP() string {
+	if c.WebAuthnRPID != "" {
+		return strings.ToLower(c.WebAuthnRPID)
+	}
+	if p, err := url.Parse(c.Issuer); err == nil {
+		return strings.ToLower(p.Hostname())
+	}
+	return ""
+}
+
+// WebAuthnName returns the relying party name, with its default.
+func (c Identity) WebAuthnName() string {
+	if c.WebAuthnRPName != "" {
+		return c.WebAuthnRPName
+	}
+	return c.MFAIssuerName
+}
+
+// WebAuthnOriginList returns the allowed origins, with the default (issuer, portal, admin).
+func (c Identity) WebAuthnOriginList() []string {
+	if len(c.WebAuthnOrigins) > 0 {
+		out := make([]string, 0, len(c.WebAuthnOrigins))
+		for _, o := range c.WebAuthnOrigins {
+			if o = strings.TrimRight(strings.TrimSpace(o), "/"); o != "" {
+				out = append(out, o)
+			}
+		}
+		return out
+	}
+	// the defaults are the origins the relying party id covers: with the default id (the issuer host) the portal
+	// and the admin app, on other hosts, cannot run a ceremony, which needs IDENTITY_WEBAUTHN_RP_ID of a parent domain
+	rp := c.WebAuthnRP()
 	var out []string
-	for _, a := range apps {
-		if a.Icon == "" {
+	for _, u := range []string{c.Issuer, c.PortalURL, c.AdminURL} {
+		o := origin(u)
+		if o == "" {
 			continue
 		}
-		u, err := url.Parse(a.Icon)
-		if err != nil {
-			continue
-		}
-		if o := u.Scheme + "://" + u.Host; !seen[o] {
-			seen[o] = true
-			out = append(out, o)
+		if p, err := url.Parse(o); err == nil {
+			if h := strings.ToLower(p.Hostname()); h == rp || strings.HasSuffix(h, "."+rp) {
+				out = append(out, o)
+			}
 		}
 	}
 	return out
+}
+
+func (c Identity) validateWebAuthn() error {
+	rp := c.WebAuthnRP()
+	if rp == "" || strings.ContainsAny(rp, "/:") {
+		return fmt.Errorf("IDENTITY_WEBAUTHN_RP_ID must be a domain name, got %q", rp)
+	}
+	origins := c.WebAuthnOriginList()
+	if len(origins) == 0 {
+		return fmt.Errorf("IDENTITY_WEBAUTHN_ORIGINS is empty")
+	}
+	for _, o := range origins {
+		p, err := url.Parse(o)
+		if err != nil || origin(o) != o || !c.okURL(o) {
+			return fmt.Errorf("IDENTITY_WEBAUTHN_ORIGINS entries must be https origins like https://auth.example.com (http only with ENV=local), got %q", o)
+		}
+		if h := strings.ToLower(p.Hostname()); h != rp && !strings.HasSuffix(h, "."+rp) {
+			return fmt.Errorf("IDENTITY_WEBAUTHN_RP_ID %q must be the host or a parent domain of every origin, %q is not", rp, o)
+		}
+	}
+	return nil
 }
 
 func (c Identity) okURL(u string) bool {
@@ -124,21 +187,6 @@ func (c Identity) okURL(u string) bool {
 		return false
 	}
 	return p.Scheme == "https" || (c.IsLocal() && p.Scheme == "http")
-}
-
-// AppLinks parses IDENTITY_APPS.
-func (c Identity) AppLinks() ([]AppLink, error) {
-	var out []AppLink
-	for _, e := range config.Lines(c.Apps) { // comma or new line separated
-		name, u, ok := strings.Cut(e, "=")
-		u, icon, _ := strings.Cut(u, "|")
-		name, u, icon = strings.TrimSpace(name), strings.TrimSpace(u), strings.TrimSpace(icon)
-		if !ok || name == "" || !c.okURL(u) || (icon != "" && !c.okURL(icon)) {
-			return nil, fmt.Errorf("IDENTITY_APPS entries are Name=https://url or Name=https://url|https://icon (http only with ENV=local), got %q", e)
-		}
-		out = append(out, AppLink{Name: name, URL: u, Icon: icon})
-	}
-	return out, nil
 }
 
 // Setup is the configuration of identity-setup (the initial setup Job): only the database.
@@ -174,11 +222,22 @@ func (c Identity) Validate() error {
 	if c.RegistrationEnabled && !roleName.MatchString(c.RegistrationRole) {
 		return fmt.Errorf("IDENTITY_REGISTRATION_ROLE must be a role name (lowercase letters, digits, _ . -), got %q", c.RegistrationRole)
 	}
-	if _, err := c.AppLinks(); err != nil {
-		return err
+	if !c.okURL(c.PortalURL) {
+		return fmt.Errorf("IDENTITY_PORTAL_URL must be an https URL (http only with ENV=local), got %q", c.PortalURL)
+	}
+	if c.RateLimitFactor < 0 || (c.RateLimitFactor > 1 && !c.IsLocal()) {
+		return fmt.Errorf("IDENTITY_RATE_LIMIT_FACTOR must not be negative, and above 1 only with ENV=local, got %d", c.RateLimitFactor)
+	}
+	if c.AdminURL != "" && !c.okURL(c.AdminURL) {
+		return fmt.Errorf("IDENTITY_ADMIN_URL must be an https URL (http only with ENV=local), got %q", c.AdminURL)
 	}
 	if c.SessionAbsoluteTTL < c.SessionIdleTTL {
 		return fmt.Errorf("IDENTITY_SESSION_ABSOLUTE_TTL must not be shorter than IDENTITY_SESSION_IDLE_TTL")
+	}
+	if c.WebAuthnEnabled {
+		if err := c.validateWebAuthn(); err != nil {
+			return err
+		}
 	}
 	return nil
 }

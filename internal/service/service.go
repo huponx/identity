@@ -14,68 +14,21 @@ import (
 	"github.com/huponx/gocommon/pagination"
 	"github.com/huponx/identity/internal/account"
 	"github.com/huponx/identity/internal/appconfig"
+	"github.com/huponx/identity/internal/catalog"
 	"github.com/huponx/identity/internal/oauth"
 	"github.com/huponx/identity/internal/password"
 	"github.com/huponx/identity/internal/state"
 	"github.com/huponx/identity/internal/store"
 	"github.com/huponx/identity/internal/token"
 	identityv1 "github.com/huponx/protogen/go/identity/v1"
+	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 )
 
-// Permissions required per method. grpcserver.WithMethodPermissions is deny by default, so a
-// new RPC has no entry here until somebody decides who may call it.
-var Permissions = map[string]string{
-	"/identity.v1.IdentityService/Introspect":           "identity:token:read",
-	"/identity.v1.IdentityService/CheckPermission":      "identity:permission:read",
-	"/identity.v1.IdentityService/RevokeToken":          "identity:token:write",
-	"/identity.v1.IdentityService/GetUser":              "identity:user:read",
-	"/identity.v1.IdentityService/ListUsers":            "identity:user:read",
-	"/identity.v1.IdentityService/CreateUser":           "identity:user:write",
-	"/identity.v1.IdentityService/SetUserDisabled":      "identity:user:write",
-	"/identity.v1.IdentityService/DeleteUser":           "identity:user:write",
-	"/identity.v1.IdentityService/SetUserPassword":      "identity:user:write",
-	"/identity.v1.IdentityService/SendPasswordReset":    "identity:user:write",
-	"/identity.v1.IdentityService/UpdateUser":           "identity:user:write",
-	"/identity.v1.IdentityService/SetUserAvatar":        "identity:user:write",
-	"/identity.v1.IdentityService/SendWelcome":          "identity:user:write",
-	"/identity.v1.IdentityService/GetUserStats":         "identity:user:read",
-	"/identity.v1.IdentityService/GetMe":                grpcserver.Public,
-	"/identity.v1.IdentityService/UpdateMe":             grpcserver.Public,
-	"/identity.v1.IdentityService/SetMyAvatar":          grpcserver.Public,
-	"/identity.v1.IdentityService/ChangeMyPassword":     grpcserver.Public,
-	"/identity.v1.IdentityService/DisableMyMFA":         grpcserver.Public,
-	"/identity.v1.IdentityService/ConfirmMyMFA":         grpcserver.Public,
-	"/identity.v1.IdentityService/BeginMyMFA":           grpcserver.Public,
-	"/identity.v1.IdentityService/GetMyMFA":             grpcserver.Public,
-	"/identity.v1.IdentityService/GetMyUserSettings":    grpcserver.Public,
-	"/identity.v1.IdentityService/PutMyUserSettings":    grpcserver.Public,
-	"/identity.v1.IdentityService/CreateRole":           "identity:role:write",
-	"/identity.v1.IdentityService/SetRolePermissions":   "identity:role:write",
-	"/identity.v1.IdentityService/UpdateRole":           "identity:role:write",
-	"/identity.v1.IdentityService/DeleteRole":           "identity:role:write",
-	"/identity.v1.IdentityService/ListRoles":            "identity:role:read",
-	"/identity.v1.IdentityService/ListPermissions":      "identity:permission:read",
-	"/identity.v1.IdentityService/CreatePermission":     "identity:permission:write",
-	"/identity.v1.IdentityService/UpdatePermission":     "identity:permission:write",
-	"/identity.v1.IdentityService/DeletePermission":     "identity:permission:write",
-	"/identity.v1.IdentityService/AssignRole":           "identity:role:write",
-	"/identity.v1.IdentityService/RevokeRole":           "identity:role:write",
-	"/identity.v1.IdentityService/CreateClient":         "identity:client:write",
-	"/identity.v1.IdentityService/UpdateClient":         "identity:client:write",
-	"/identity.v1.IdentityService/SetClientDisabled":    "identity:client:write",
-	"/identity.v1.IdentityService/DeleteClient":         "identity:client:write",
-	"/identity.v1.IdentityService/RotateClientSecret":   "identity:client:write",
-	"/identity.v1.IdentityService/ListClients":          "identity:client:read",
-	"/identity.v1.IdentityService/SetExchangePolicy":    "identity:exchange:write",
-	"/identity.v1.IdentityService/ListExchangePolicies": "identity:exchange:read",
-	"/identity.v1.IdentityService/GetUserMFA":           "identity:mfa:read",
-	"/identity.v1.IdentityService/SetUserMFA":           "identity:mfa:write",
-	"/identity.v1.IdentityService/EnforceUserMFA":       "identity:mfa:write",
-	"/identity.v1.IdentityService/ResetUserMFA":         "identity:mfa:write",
-	"/identity.v1.IdentityService/GetUIStyle":           grpcserver.Public,
-	"/identity.v1.IdentityService/SetUIStyle":           "identity:settings:write",
-}
+// Permissions is the rule of every method, read from the authz.v1.rule options of identity.proto (the permissions
+// themselves are declared in permissions.proto). grpcserver.WithMethodPermissions is deny by default: an RPC without
+// a rule is closed, and TestCoverage fails the build for it.
+var Permissions = grpcserver.PermissionsFromProto(identityv1.File_identity_v1_identity_proto, identityv1.File_identity_v1_permissions_proto)
 
 // Service is the gRPC implementation.
 type Service struct {
@@ -86,6 +39,10 @@ type Service struct {
 	State   *state.State
 	Tokens  *token.Service
 	MFAMode string
+	// Log receives one line per change of the permission catalog (nil: none).
+	Log *zap.Logger
+	// RegistrationEnabled is IDENTITY_REGISTRATION_ENABLED, shown (read only) in the registration settings.
+	RegistrationEnabled bool
 }
 
 // New builds the service.
@@ -105,15 +62,27 @@ func toErr(err error) error {
 	case errors.Is(err, store.ErrConflict):
 		return apperror.AlreadyExists("already exists")
 	case errors.Is(err, store.ErrUnknownPermission):
-		return apperror.InvalidArgument("a permission is not in the catalog; add it to the permissions first").WithReason("unknown_permission")
+		return apperror.InvalidArgument("a permission is not a declared permission or a wildcard that covers one").WithReason("unknown_permission")
+	case errors.Is(err, store.ErrInvalidPermissionDef):
+		return apperror.InvalidArgument(err.Error()).WithReason("invalid_permission_definition")
 	case errors.Is(err, store.ErrClientNotDisabled):
 		return apperror.FailedPrecondition("disable the client before deleting it").WithReason("client_not_disabled")
 	case errors.Is(err, store.ErrLastAdmin):
 		return apperror.FailedPrecondition("this is the last admin; assign the admin role to another user first").WithReason("last_admin")
 	case errors.Is(err, store.ErrRoleInUse):
 		return apperror.FailedPrecondition("a user or a client still holds this role").WithReason("role_in_use")
-	case errors.Is(err, store.ErrPermissionInUse):
-		return apperror.FailedPrecondition("a role still holds this permission").WithReason("permission_in_use")
+	case errors.Is(err, account.ErrSessionNotFound):
+		return apperror.NotFound("the session does not exist").WithReason("session_not_found")
+	case errors.Is(err, account.ErrPasskeyOff):
+		return apperror.NotFound("passkeys are turned off on this server").WithReason("passkeys_off")
+	case errors.Is(err, account.ErrPasskeyInvalid):
+		return apperror.InvalidArgument("the passkey was not accepted").WithReason("invalid_passkey")
+	case errors.Is(err, account.ErrPasskeyNotFound):
+		return apperror.NotFound("the passkey does not exist").WithReason("passkey_not_found")
+	case errors.Is(err, account.ErrPasskeyLimit):
+		return apperror.FailedPrecondition("the user has the maximum number of passkeys").WithReason("passkey_limit")
+	case errors.Is(err, account.ErrPasskeyName):
+		return apperror.InvalidArgument("the name must have 1 to 60 characters").WithReason("invalid_passkey_name")
 	case errors.Is(err, account.ErrInvalidCredentials):
 		return apperror.InvalidArgument("the current password is wrong").WithReason("wrong_current_password")
 	case errors.Is(err, account.ErrRateLimited):
@@ -122,6 +91,10 @@ func toErr(err error) error {
 		return apperror.InvalidArgument("the code is wrong").WithReason("invalid_mfa_code")
 	case errors.Is(err, account.ErrMFAEnabled):
 		return apperror.FailedPrecondition("multi-factor authentication is already on").WithReason("mfa_already_enabled")
+	case errors.Is(err, account.ErrAwaitingApproval):
+		return apperror.FailedPrecondition("the user is awaiting approval").WithReason("awaiting_approval")
+	case errors.Is(err, account.ErrNotAwaitingApproval):
+		return apperror.FailedPrecondition("the user is not awaiting approval").WithReason("not_awaiting_approval")
 	case errors.Is(err, account.ErrNotPending):
 		return apperror.FailedPrecondition("the user already has a password").WithReason("password_already_set")
 	case errors.Is(err, account.ErrMFAForced):
@@ -201,12 +174,14 @@ func (s *Service) RevokeToken(ctx context.Context, req *identityv1.RevokeTokenRe
 
 // ---- users ----
 
-// userStatus: disabled wins; a user without a password is pending (a new user becomes active only
+// userStatus: disabled wins, then a user awaiting approval; a user without a password is pending (a new user becomes active only
 // after setting one through the welcome mail); everybody else is active.
 func userStatus(u *store.User) identityv1.UserStatus {
 	switch {
 	case u.Disabled:
 		return identityv1.UserStatus_USER_STATUS_DISABLED
+	case u.PendingApproval:
+		return identityv1.UserStatus_USER_STATUS_PENDING_APPROVAL
 	case u.PasswordHash == "":
 		return identityv1.UserStatus_USER_STATUS_PENDING
 	default:
@@ -251,7 +226,7 @@ func (s *Service) GetUserStats(ctx context.Context, _ *identityv1.GetUserStatsRe
 		return nil, toErr(err)
 	}
 	return &identityv1.GetUserStatsResponse{
-		Total: st.Total, Active: st.Active, Pending: st.Pending, Disabled: st.Disabled,
+		Total: st.Total, Active: st.Active, Pending: st.Pending, Disabled: st.Disabled, AwaitingApproval: st.AwaitingApproval,
 		MfaEnabled: st.MFAEnabled, MfaEnforced: st.MFAEnforced, WithAvatar: st.WithAvatar,
 		SignedIn_30D: st.SignedIn30d, NeverSignedIn: st.NeverSignedIn, CreatedThisMonth: st.CreatedThisMonth,
 	}, nil
@@ -286,6 +261,8 @@ func (s *Service) GetUser(ctx context.Context, req *identityv1.GetUserRequest) (
 
 func statusFilter(s identityv1.UserStatus) string {
 	switch s {
+	case identityv1.UserStatus_USER_STATUS_PENDING_APPROVAL:
+		return "awaiting_approval"
 	case identityv1.UserStatus_USER_STATUS_PENDING:
 		return "pending"
 	case identityv1.UserStatus_USER_STATUS_ACTIVE:
@@ -406,6 +383,28 @@ func (s *Service) SendWelcome(ctx context.Context, req *identityv1.SendWelcomeRe
 	return &identityv1.SendWelcomeResponse{}, nil
 }
 
+func (s *Service) ApproveUser(ctx context.Context, req *identityv1.ApproveUserRequest) (*identityv1.ApproveUserResponse, error) {
+	u, err := s.Store.UserByID(ctx, req.GetUserId())
+	if err != nil {
+		return nil, toErr(err)
+	}
+	if err := s.Acct.ApproveRegistration(ctx, u); err != nil {
+		return nil, toErr(err)
+	}
+	return &identityv1.ApproveUserResponse{}, nil
+}
+
+func (s *Service) RejectUser(ctx context.Context, req *identityv1.RejectUserRequest) (*identityv1.RejectUserResponse, error) {
+	u, err := s.Store.UserByID(ctx, req.GetUserId())
+	if err != nil {
+		return nil, toErr(err)
+	}
+	if err := s.Acct.RejectRegistration(ctx, u); err != nil {
+		return nil, toErr(err)
+	}
+	return &identityv1.RejectUserResponse{}, nil
+}
+
 func (s *Service) SetUserDisabled(ctx context.Context, req *identityv1.SetUserDisabledRequest) (*identityv1.SetUserDisabledResponse, error) {
 	if err := s.Store.SetUserDisabled(ctx, req.GetUserId(), req.GetDisabled()); err != nil {
 		return nil, toErr(err)
@@ -475,8 +474,42 @@ func validPerms(perms []string) error {
 	return nil
 }
 
-func toRole(r store.Role) *identityv1.Role {
-	return &identityv1.Role{Name: r.Name, Description: r.Description, Permissions: r.Permissions, AssignedCount: r.AssignedCount}
+// toRole converts a role; known (nil: unknown) marks the grants that do nothing any more as retired.
+func toRole(r store.Role, known *catalog.Known) *identityv1.Role {
+	out := &identityv1.Role{Name: r.Name, Description: r.Description, Permissions: r.Permissions, AssignedCount: r.AssignedCount}
+	if known != nil {
+		out.RetiredPermissions = known.Stale(r.Permissions)
+	}
+	return out
+}
+
+// known reads the permissions that are not retired and derives the wildcards from them.
+func (s *Service) known(ctx context.Context) (*catalog.Known, error) {
+	active, err := s.Store.ActivePermissions(ctx)
+	if err != nil {
+		return nil, toErr(err)
+	}
+	return catalog.NewKnown(active), nil
+}
+
+// checkGrantable refuses a name that is neither a declared permission nor a generated wildcard. A name the role
+// holds already (a retired permission, a wildcard that covers nothing) stays accepted, so the role page can save
+// the other changes; the way to drop it is to leave it out.
+func (s *Service) checkGrantable(ctx context.Context, perms, held []string) (*catalog.Known, error) {
+	k, err := s.known(ctx)
+	if err != nil {
+		return nil, err
+	}
+	heldSet := map[string]bool{}
+	for _, h := range held {
+		heldSet[h] = true
+	}
+	for _, p := range perms {
+		if !k.Has(p) && !heldSet[p] {
+			return nil, apperror.InvalidArgument("unknown permission "+p).WithReason("unknown_permission", "name", p)
+		}
+	}
+	return k, nil
 }
 
 func (s *Service) CreateRole(ctx context.Context, req *identityv1.CreateRoleRequest) (*identityv1.CreateRoleResponse, error) {
@@ -484,14 +517,26 @@ func (s *Service) CreateRole(ctx context.Context, req *identityv1.CreateRoleRequ
 		return nil, err
 	}
 	r := store.Role{Name: req.GetRole().GetName(), Description: req.GetRole().GetDescription(), Permissions: req.GetRole().GetPermissions()}
+	k, err := s.checkGrantable(ctx, r.Permissions, nil)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.Store.CreateRole(ctx, r); err != nil {
 		return nil, toErr(err)
 	}
-	return &identityv1.CreateRoleResponse{Role: toRole(r)}, nil
+	return &identityv1.CreateRoleResponse{Role: toRole(r, k)}, nil
 }
 
 func (s *Service) SetRolePermissions(ctx context.Context, req *identityv1.SetRolePermissionsRequest) (*identityv1.SetRolePermissionsResponse, error) {
 	if err := validPerms(req.GetPermissions()); err != nil {
+		return nil, err
+	}
+	cur, err := s.Store.RoleByName(ctx, req.GetRole())
+	if err != nil {
+		return nil, toErr(err)
+	}
+	k, err := s.checkGrantable(ctx, req.GetPermissions(), cur.Permissions)
+	if err != nil {
 		return nil, err
 	}
 	if err := s.Store.SetRolePermissions(ctx, req.GetRole(), req.GetPermissions()); err != nil {
@@ -501,7 +546,7 @@ func (s *Service) SetRolePermissions(ctx context.Context, req *identityv1.SetRol
 	if err != nil {
 		return nil, toErr(err)
 	}
-	return &identityv1.SetRolePermissionsResponse{Role: toRole(*r)}, nil
+	return &identityv1.SetRolePermissionsResponse{Role: toRole(*r, k)}, nil
 }
 
 func (s *Service) UpdateRole(ctx context.Context, req *identityv1.UpdateRoleRequest) (*identityv1.UpdateRoleResponse, error) {
@@ -511,6 +556,14 @@ func (s *Service) UpdateRole(ctx context.Context, req *identityv1.UpdateRoleRequ
 	if err := validPerms(req.GetPermissions()); err != nil {
 		return nil, err
 	}
+	cur, err := s.Store.RoleByName(ctx, req.GetRole())
+	if err != nil {
+		return nil, toErr(err)
+	}
+	k, err := s.checkGrantable(ctx, req.GetPermissions(), cur.Permissions)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.Store.UpdateRole(ctx, req.GetRole(), req.GetDescription(), req.GetPermissions()); err != nil {
 		return nil, toErr(err)
 	}
@@ -518,7 +571,7 @@ func (s *Service) UpdateRole(ctx context.Context, req *identityv1.UpdateRoleRequ
 	if err != nil {
 		return nil, toErr(err)
 	}
-	return &identityv1.UpdateRoleResponse{Role: toRole(*r)}, nil
+	return &identityv1.UpdateRoleResponse{Role: toRole(*r, k)}, nil
 }
 
 func (s *Service) DeleteRole(ctx context.Context, req *identityv1.DeleteRoleRequest) (*identityv1.DeleteRoleResponse, error) {
@@ -548,13 +601,17 @@ func (s *Service) ListRoles(ctx context.Context, req *identityv1.ListRolesReques
 	if err != nil {
 		return nil, toErr(err)
 	}
+	known, err := s.known(ctx)
+	if err != nil {
+		return nil, err
+	}
 	out := &identityv1.ListRolesResponse{Total: total}
 	if len(roles) > size {
 		roles = roles[:size]
 		out.NextPageToken = pagination.Encode(roles[size-1].Name)
 	}
 	for _, r := range roles {
-		out.Roles = append(out.Roles, toRole(r))
+		out.Roles = append(out.Roles, toRole(r, known))
 	}
 	return out, nil
 }
@@ -841,7 +898,11 @@ func (s *Service) GetUserMFA(ctx context.Context, req *identityv1.GetUserMFARequ
 	if err != nil {
 		return nil, toErr(err)
 	}
-	return &identityv1.GetUserMFAResponse{Enabled: u.MFAEnabled, Enforced: u.MFAEnforced, Mode: s.MFAMode, RecoveryCodesLeft: int32(left)}, nil
+	passkeys, err := s.Store.CountPasskeys(ctx, u.ID)
+	if err != nil {
+		return nil, toErr(err)
+	}
+	return &identityv1.GetUserMFAResponse{Enabled: u.MFAEnabled, Enforced: u.MFAEnforced, Mode: s.MFAMode, RecoveryCodesLeft: int32(left), PasskeyCount: int32(passkeys)}, nil
 }
 
 // SetUserMFA turns MFA off for a user (the user's authenticator is deleted). Turning it on is

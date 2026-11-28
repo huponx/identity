@@ -13,7 +13,7 @@ changes with the method. The receiver side is `gocommon/grpcserver`, the caller 
 | # | Method | Token | Who the receiver sees | Needs identity | Secrets to manage | Typical use |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | Kubernetes ServiceAccount token | Projected ServiceAccount JWT, checked with `TokenReview` | A service (`system:serviceaccount:<ns>:<name>`) | No | None (kubelet rotates the file) | Service to service inside the cluster, with no user: identity to courier |
-| 2 | Static Bearer token | A shared string | "Someone who has the string" | No | One shared secret | Local development only |
+| 2 | (none) | | | | | Local development: a local courier does not authenticate services; identity has no static token (use 3) |
 | 3 | Client credentials (service JWT) | JWT from identity, `sub` = client id | A service, with the permissions of its roles | Yes | Client secret (vault) | Jobs and calls that are not on behalf of a user, when the receiver uses permissions |
 | 4 | Token exchange (on behalf of a user) | JWT from identity, `sub` = user, `act` = caller | The user, and the service that acts for them | Yes | Client secret of the caller | Gateway to service, and a service that calls another service for the same user |
 | 5 | Exchange of a service token | JWT from identity, `sub` = service, `act` = caller | A service, forwarded by a gateway | Yes | Client secret of the caller | A service calls the gateway, which calls an upstream |
@@ -27,7 +27,7 @@ flowchart TD
     Q1 -- no --> Q2{Does the receiver check permissions per method?}
     Q2 -- yes --> M3[3: client credentials]
     Q2 -- no, an allow list is enough --> M1[1: ServiceAccount token]
-    Q3{Running on a laptop, no Kubernetes?} -- yes --> M2[2: static token, ENV=local only]
+    Q3{Running on a laptop, no Kubernetes?} -- yes --> M2[3: client credentials; a local courier is open to services]
 ```
 
 ## 2. Method 1 — Kubernetes ServiceAccount token
@@ -67,17 +67,17 @@ Properties:
 - Health checks (`/grpc.health.v1.Health/*`) skip authentication. Reflection does not.
 - From a laptop use a short token: `kubectl create token <sa> -n <ns> --audience courier --duration 10m`.
 
-Used today: identity calls courier to send e-mails (`identity/internal/notify`), courier accepts only listed ServiceAccounts.
+Used today: identity calls courier to send e-mails (`identity/internal/notify`, `Notify` by `user_ids`), courier accepts only listed ServiceAccounts. Courier calls back identity `GetUser` to resolve the e-mail and language of those users, with method 3 (client `courier`, permission `identity:user:read`).
 
-## 3. Method 2 — static Bearer token (local only)
+## 3. Method 2 — none (local runs)
 
-| Side | Code | Configuration |
-| --- | --- | --- |
-| Receiver | `grpcserver.WithBearerAuth(token)` or `WithOptionalBearerAuth` (`grpcserver/auth.go`), constant time compare | Identity: `IDENTITY_S2S_TOKEN`, honoured **only when `ENV=local`** (`cmd/identity/main.go`). Courier does not use it: with `ENV=local` it makes auth optional, otherwise it requires KubeAuth. |
-| Caller | `grpcclient.WithBearerToken(token)` | Identity: `COURIER_S2S_TOKEN` as the token it sends to courier (used when `COURIER_TOKEN_FILE` is empty) |
+There is no static shared token any more (it was `IDENTITY_S2S_TOKEN` and `COURIER_S2S_TOKEN`): it named no caller, carried no permission and
+differed from what runs in production. On a laptop:
 
-- One shared string, no audience, no identity of the caller, no expiry. Never use it outside a laptop. Services ignore it unless `ENV=local`.
-- It exists so that a developer can run services without a cluster or an identity.
+- **A call to identity** uses method 3: `scripts/local.sh` creates the client `courier-dev` (and `dictionary-dev`) with its secret in `.local/`, the roles
+  and the exchange policy, exactly as the setup Job does in a cluster.
+- **A call to courier** needs nothing: with `ENV=local` courier does not authenticate services (it logs a warning) and trusts them by name `local`. Users
+  still need their token for the inbox and the admin screens.
 
 ## 4. Method 3 — client credentials (service JWT)
 
@@ -196,7 +196,7 @@ See the README of the gatekeeper, "Adding a service that calls the gateway".
 A receiver can accept more than one method. In `gocommon/grpcserver`:
 
 - `AnyAuth(fn1, fn2, ...)` tries each in order and accepts if one accepts. Put cheap local checks (JWT) before remote ones (KubeAuth). When none accepts, the first error that is not `Unauthenticated` wins.
-- Identity uses `AnyAuth(JWTAuth)`, plus the static token when `ENV=local` (`cmd/identity/main.go`). Courier uses KubeAuth outside local.
+- Identity uses `AnyAuth(JWTAuth)` (`cmd/identity/main.go`). Courier uses `AnyAuth(JWTAuth, KubeAuth)` outside local, and no service authentication with `ENV=local`.
 
 Authorization is a separate step, `WithMethodPermissions(map[method]permission)` (`grpcserver/jwtauth.go`, `checkMethod`):
 
@@ -217,7 +217,7 @@ For HTTP services the same ideas exist as `httpx.JWTAuth(verifier)` and `httpx.R
 | Internal job, no user, the receiver checks permissions by role | 3 (client credentials) |
 | A user clicked something and service A calls B | 4 (exchange) |
 | A browser, mobile app or service calls the platform from outside | Through the gatekeeper: cookie or Bearer, then 4 or 5 |
-| Local development without Kubernetes | 2 (static token, `ENV=local`) |
+| Local development without Kubernetes | 3 (client credentials); a local courier needs none |
 | A service must not act as a user | Never exchange a user token for it: use 3 |
 
 Mixing is normal: courier accepts only method 1; identity accepts JWT (3, 4, 5); a service that serves the
@@ -248,7 +248,6 @@ gateway accepts JWT with audience equal to its own name.
 | Piece | Location |
 | --- | --- |
 | ServiceAccount token check | `gocommon/grpcserver/kubeauth.go` |
-| Static token | `gocommon/grpcserver/auth.go`, `gocommon/grpcclient/options.go` (`WithBearerToken`) |
 | Token file (projected token) | `gocommon/grpcclient/tokenfile.go` (`WithBearerTokenFile`) |
 | JWT receiver, `AnyAuth`, method permissions | `gocommon/grpcserver/jwtauth.go` |
 | Service token, exchange on the caller side | `gocommon/tokenexchange/tokenexchange.go`, `gocommon/grpcclient/jwt.go` (`WithServiceToken`, `WithTokenExchange`) |

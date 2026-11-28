@@ -17,7 +17,7 @@ func likePrefix(text string) string {
 type UserFilter struct {
 	EmailPrefix  string // case insensitive
 	NameContains string // case insensitive
-	Status       string // "pending", "active" or "disabled" (the rule of the API: disabled first, then no password = pending)
+	Status       string // "awaiting_approval", "pending", "active" or "disabled" (the rule of the API: disabled first, then no password = pending)
 	Role         string
 }
 
@@ -42,8 +42,10 @@ func (s *Store) ListUsers(ctx context.Context, f UserFilter, after string, limit
 	switch f.Status {
 	case "disabled":
 		where = append(where, `disabled`)
+	case "awaiting_approval":
+		where = append(where, `NOT disabled AND pending_approval`)
 	case "pending":
-		where = append(where, `NOT disabled AND password_hash IS NULL`)
+		where = append(where, `NOT disabled AND password_hash IS NULL AND NOT pending_approval`)
 	case "active":
 		where = append(where, `NOT disabled AND password_hash IS NOT NULL`)
 	}

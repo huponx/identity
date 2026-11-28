@@ -30,7 +30,7 @@ What happens when a user calls an auth API or a normal API through the gatekeepe
 | `POST /oauth2/token` | grants `authorization_code`, `refresh_token` (rotation + reuse detection), `client_credentials`, `urn:ietf:params:oauth:grant-type:token-exchange` |
 | `POST /oauth2/revoke`, `POST /oauth2/introspect`, `/userinfo` | RFC 7009, RFC 7662, OIDC |
 | `/oauth2/logout` | RP-initiated logout and back-channel logout to the clients |
-| `/login`, `/login/mfa`, `/password/forgot`, `/password/reset`, `/account/mfa`, `/logout` | the sign in app (React, `web/apps/auth`, copied into the image at `/ui`, `IDENTITY_UI_DIR`) |
+| `/login`, `/login/mfa`, `/password/forgot`, `/password/reset`, `/password/set`, `/account/mfa`, `/logout` | the sign in app (React, `web/apps/auth`, copied into the image at `/ui`, `IDENTITY_UI_DIR`) |
 | `/auth-api/*` | JSON API of that app (CSRF token in the body, `__Host-` cookies, security headers) |
 
 ## Tokens
@@ -38,6 +38,16 @@ What happens when a user calls an auth API or a normal API through the gatekeepe
 Access tokens are JWTs signed with ES256/RS256 (`kid` in the JWKS), `aud` = the service they are for, claims `sub`, `jti`, `scope`, `roles`, `perms`, `client_id`, `amr`, `acr`, `sid`; exchanged tokens add `act` (who acts for the user). Services verify them **locally** with the JWKS (`gocommon/jwtx`) and use `introspect` only for immediate revocation checks.
 
 Permissions are colon separated segments with segment wildcards: `*` alone matches everything, a middle `*` matches one segment, a trailing `*` one or more (`identity:*:read`, `courier:notification:send`). Roles: `admin` (`*`) and `viewer` are seeded.
+
+### Where permissions come from
+
+Permissions are **defined by the services, in code**, not by administrators (the admin app only reads them):
+
+- Each service lists its permissions in one file, `protos/<service>/v1/permissions.proto`, and names them in the `authz.v1.rule` option of each RPC (`any_of`, `all_of` or `public`). Identity declares `identity:*` there; `bill:*` and `system:*` (no process of their own) are synced by identity from its copy of their files (`service.OwnPermissionFiles`).
+- **At start identity saves its own file in the catalog** (`identity_permissions`: `service`, `description`, `retired_at`), one transaction per service, before it listens; a database error stops the start. Other services call `RegisterPermissions(service, permissions[])` at their start (service token, permission `identity:permission:register`, held by the role `service_registrar`; set `"roles":["service_registrar"]` on the client in `SETUP_CONFIG`). A service may only register names that start with `<service>:`, and only if its client's `resource` is that service. The service is not ready until it succeeded and exits after `PERMISSIONS_SYNC_TIMEOUT` (default 2m), so a rolling deploy halts on the new pods while the old ones keep serving the old set.
+- A sync is a set diff per service: new -> insert; changed description -> update; `renamed_from` -> the role grants of the old name move to the new one and the old row goes; **gone from the code** -> deleted when no role holds it, else **retired** (`retired_at`). The role grants stay, a re-add or a rename restores them, a retired permission is left out of the `perms` of tokens and of the role editor, the role page lists it as "retired" and the grant can be removed there (`SetRolePermissions` accepts a retired name that the role already holds, never a new one). A retired permission that no role holds any more is deleted at the next sync. The sync never touches `identity_user_roles` or grants of wildcards, never retires the permissions of a service that did not report in, and logs every change.
+- **Wildcards are not stored.** `ListPermissions` adds the ones that cover at least one declared permission (`wildcard: true`): `*`, `<service>:*`, `<service>:*:<action>`, `<service>:<resource>:*`. `SetRolePermissions` accepts a catalog permission or such a wildcard, else `unknown_permission`. A wildcard grant that no longer covers anything (its service left the code) is kept and shown as retired; it matches nothing. `*` is always valid.
+- Rows nobody owns (created by an administrator before this, `service = ''`) go through the same rule at the first start.
 
 **Token exchange** is deny by default: it needs a row in `identity_exchange_policies` `(client, audience)`; the subject token must be a live access token whose audience is the caller's `resource`; scope can only narrow; permissions are re-read from the database and filtered by audience; the result lives 2 minutes, has no refresh token and carries the caller in `act`.
 
@@ -52,17 +62,75 @@ Permissions are colon separated segments with segment wildcards: `*` alone match
 | `IDENTITY_SESSION_IDLE_TTL` / `_ABSOLUTE_TTL` | `8h` / `168h` | SSO session |
 | `IDENTITY_MFA_MODE` | `optional` | `off`, `optional` (each user chooses) or `required` (everyone) |
 | `IDENTITY_MFA_KEY` | required unless `off` | `id:base64(32 bytes)`, comma separated; the first seals TOTP secrets (AES-GCM), the others only open (rotation) |
-| `IDENTITY_MFA_ISSUER_NAME` | `Example` | label in authenticator apps |
+| `IDENTITY_MFA_ISSUER_NAME` | `Example` | label in authenticator apps, and the name next to the logo in every e-mail |
 | `IDENTITY_AUTH_AUDIENCE` | `identity` | `aud` accepted by the gRPC API |
 | `IDENTITY_TRUSTED_PROXIES` | empty | CIDRs of the ingress, for the client IP of the rate limits |
-| `IDENTITY_APPS` | empty | `Name=https://url` or `Name=https://url|https://icon` entries, one per line in a YAML block scalar (`|-`) or comma separated: the applications of `/apps` (the icon is optional; its origin is added to the `img-src` of the CSP), where a user lands after signing in at identity itself (no `return_to`) |
-| `IDENTITY_REGISTRATION_ENABLED` | `false` | opens `POST /auth-api/register` (self-registration, the "Create an account" link of the sign in page); off, the endpoint answers 404. No CAPTCHA: only the rate limit per client IP (10/hour) and per e-mail (3/hour) |
+| `IDENTITY_PORTAL_URL` | required | the portal (https; http only with `ENV=local`): where a user lands after signing in at identity itself (no `return_to`), and where `/` sends a signed in user |
+| `IDENTITY_REGISTRATION_ENABLED` | `false` | opens `POST /auth-api/register` (self-registration, the "Create an account" link of the sign in page); off, the endpoint answers 404. No CAPTCHA: only the rate limit per client IP (10/hour) and per e-mail (3/hour). What happens after a request is the system setting **registration requires approval** (Admin → System settings, default **on**): see below |
+| `IDENTITY_RATE_LIMIT_FACTOR` | `1` | multiplies the maximum of every rate limit (login, registration, password reset, MFA); above 1 only with `ENV=local` (`scripts/local.sh` sets 100), otherwise the service does not start |
+| `IDENTITY_ADMIN_URL` | empty | the admin app (https; http only with `ENV=local`): the "new registration" mail to the users who may approve links to `{IDENTITY_ADMIN_URL}/users/{id}` of the applicant; empty omits the link |
+| `IDENTITY_WEBAUTHN_ENABLED` | `true` | passkeys (WebAuthn): a way to sign in next to the password, and a second factor. Off, the passkey endpoints answer 404 and the pages hide them |
+| `IDENTITY_WEBAUTHN_RP_ID` | host of `IDENTITY_ISSUER` | the relying party id: the host, or a parent domain, of every origin below. **It is bound into every passkey: changing it later makes all of them unusable.** Choose the registrable domain the issuer, the portal and the admin app share (`momofamily.top` for `auth.momofamily.top`, `momofamily.top`, `admin.momofamily.top`) before the first passkey is made, and keep it. `localhost` locally |
+| `IDENTITY_WEBAUTHN_RP_NAME` | `IDENTITY_MFA_ISSUER_NAME` | the name the authenticator shows |
+| `IDENTITY_WEBAUTHN_ORIGINS` | the issuer, portal and admin origins that the RP ID covers | origins (`https://host`, no path; http only with `ENV=local`) allowed to run a ceremony; the portal runs it too, through the gateway. The service refuses to start when the RP ID is not the host or a parent domain of one of them. With the default RP ID (the issuer host) the portal and admin origins are left out: set the RP ID to the shared parent domain to use passkeys there |
 | `IDENTITY_REGISTRATION_ROLE` | `member` | role of a self-registered account (migration V36 creates it with the dictionary permissions) |
 | `IDENTITY_UI_DIR` | `/ui` | build of the sign in app (`web/apps/auth`; the image carries it). Required unless `ENV=local`, where the page paths answer 503 without it |
 | `COURIER_TARGET`, `COURIER_TOKEN_FILE` | empty | e-mails; empty disables them (links are logged when `ENV=local`) |
 | `POSTGRES_*`, `REDIS_*`, `HOST`, `ENV`, `LOG_*` | | gocommon blocks |
 
 MFA per user: with `optional` a user turns it on/off in `/account/mfa` (disabling asks for the password and a code); an admin can enforce, un-enforce, disable or reset it per user (in the admin app, or `SetUserMFA`/`EnforceUserMFA`/`ResetUserMFA` over gRPC). Recovery codes are shown once.
+
+## Passkeys
+
+A passkey (WebAuthn credential) is a second way to sign in, next to the password. It is usernameless (a discoverable
+credential: the browser lists the passkeys, no e-mail is typed), always asks for user verification (biometric or PIN) and
+takes no attestation. Because of the user verification a passkey login counts as multi-factor: the session gets
+`amr` `["swk","mfa"]` (synced, backup eligible key) or `["hwk","mfa"]` (device bound), `acr=mfa` appears in the tokens, and it
+satisfies mode `required`, a user's enforcement and `acr_values=mfa` without a TOTP step. A user who signs in with the
+password stays a password sign in: a passkey is not asked for after it, unless MFA is required (mode `required` or the
+user is enforced), when it is the second factor (a user with a passkey and no TOTP is then asked for it, not sent to
+enroll). A TOTP device is always asked for. A client that asks for `acr_values=mfa` gets the passkey step for a password
+session of a user who has one.
+
+- **The RP ID cannot change.** It is bound into every passkey (`IDENTITY_WEBAUTHN_RP_ID`, see Configuration): set it to the
+  domain the issuer, the portal and the admin app share before the first passkey is made.
+- Table `identity_user_passkeys` (migration V39). The WebAuthn user handle is the user id (opaque). The public key is stored
+  as it is (no sealing, unlike the TOTP secret). A sign count that does not move forward is refused and logged.
+- The ceremony state lives in Redis (`identity:wa:*`, 5 minutes, **single use**), tagged with its purpose (`login`, `mfa`,
+  `register`): an answer to the options of another purpose is refused.
+- Adding or deleting a passkey needs the **current password** (a stolen session cannot add a key) and sends the user a mail
+  (the `identity_mfa_changed` template with `passkey_added` / `passkey_removed`). The administrator's "Reset MFA"
+  (`ResetUserMFA`) removes the passkeys too; turning TOTP off does not.
+- Rate limits (`state.Allow`): 60 begin/finish per client IP per 5 minutes, 10 failures per user per 10 minutes, the password
+  of an add/delete 5 per 15 minutes; the second factor shares the `mfa:user:` limiter and the 5 tries per challenge.
+- gRPC for the portal: `ListMyPasskeys`, `BeginMyPasskey`, `FinishMyPasskey`, `RenameMyPasskey`, `DeleteMyPasskey` (`public`
+  rules like the other `*My*` RPCs, routes `/api/me/passkeys` in the gateway); `GetUserMFA` returns `passkey_count`.
+- Tests: `internal/passkey` runs the ceremonies with a software authenticator (`passkeytest`); `internal/oauth/passkey_test.go`
+  runs the whole server on PostgreSQL and Redis (`IDENTITY_TEST_POSTGRES_URL` and `IDENTITY_TEST_REDIS_URL`).
+
+## Active sessions
+
+Every sign in (password, password + code, passkey, enrollment) creates one SSO session in Redis, so a user who signs in on
+three browsers has three. Besides the user, the methods (`amr`) and the times, a session keeps what identifies the device:
+the **IP** (`c.ClientIP()`, which honours `IDENTITY_TRUSTED_PROXIES`), the **User-Agent** (cut to 512 bytes) and a **last
+seen** time, written at most once a minute (on a read of the session, with its idle expiry kept). The browser, OS and
+kind of device are parsed from the User-Agent when the list is read (`internal/useragent`, a small rule table), so a
+better table also describes the sessions that exist. Nothing else is stored: no login history, no location, and everything
+goes with the session (idle `IDENTITY_SESSION_IDLE_TTL`, absolute `IDENTITY_SESSION_ABSOLUTE_TTL`, or when it is ended). A session
+created before this existed shows as "Unknown device".
+
+The API (all non-breaking): the signed-in user sees and ends **their own** sessions (`ListMySessions`, `RevokeMySession`,
+`RevokeMyOtherSessions`; gateway `GET /api/me/sessions`, `DELETE /api/me/sessions/{id}`, `POST /api/me/sessions/revoke-others`;
+`current` is the session whose `sid` is in the caller's token; another user's or an unknown id is NOT_FOUND
+`session_not_found`; ending the current one is a sign out). An administrator with `identity:user:read` lists the sessions
+of a user (`ListUserSessions`, `GET /api/users/{user_id}/sessions`) and with `identity:user:write` ends all of them
+(`RevokeUserSessions`, `DELETE /api/users/{user_id}/sessions`, the same as disabling the user without disabling: every
+session, every refresh token and the access token cutoff). There is no revoke of a single session of another user.
+
+Ending a session deletes it, revokes its refresh tokens and sends back-channel logout to the clients that used it, so the
+portal and admin (gatekeeper) sessions of that browser end too. **Access tokens already issued are not recalled**: where a
+service verifies them locally they work until they expire (`IDENTITY_ACCESS_TOKEN_TTL`, 10 minutes by default);
+introspection and token exchange refuse them only after "sign out of all sessions" of an administrator (the cutoff).
 
 ## CI/CD
 
