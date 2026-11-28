@@ -181,3 +181,87 @@ func (s *Service) DisableMyMFA(ctx context.Context, req *identityv1.DisableMyMFA
 	}
 	return &identityv1.DisableMyMFAResponse{}, nil
 }
+
+func (s *Service) RegenerateMyRecoveryCodes(ctx context.Context, req *identityv1.RegenerateMyRecoveryCodesRequest) (*identityv1.RegenerateMyRecoveryCodesResponse, error) {
+	u, err := s.myUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	codes, err := s.Acct.RegenerateRecoveryCodes(ctx, u, req.GetPassword(), req.GetCode())
+	if err != nil {
+		return nil, toErr(err)
+	}
+	return &identityv1.RegenerateMyRecoveryCodesResponse{RecoveryCodes: codes}, nil
+}
+
+// ---- passkeys ----
+
+func passkeyMsg(p store.Passkey) *identityv1.Passkey {
+	out := &identityv1.Passkey{Id: p.ID, Name: p.Name, CreatedAt: p.CreatedAt.Unix(), Synced: p.BackupEligible}
+	if p.LastUsedAt != nil {
+		out.LastUsedAt = p.LastUsedAt.Unix()
+	}
+	return out
+}
+
+func (s *Service) ListMyPasskeys(ctx context.Context, _ *identityv1.ListMyPasskeysRequest) (*identityv1.ListMyPasskeysResponse, error) {
+	u, err := s.myUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	list, err := s.Acct.ListPasskeys(ctx, u)
+	if err != nil {
+		return nil, toErr(err)
+	}
+	out := &identityv1.ListMyPasskeysResponse{Max: account.MaxPasskeys}
+	for _, p := range list {
+		out.Passkeys = append(out.Passkeys, passkeyMsg(p))
+	}
+	return out, nil
+}
+
+func (s *Service) BeginMyPasskey(ctx context.Context, req *identityv1.BeginMyPasskeyRequest) (*identityv1.BeginMyPasskeyResponse, error) {
+	u, err := s.myUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	id, options, err := s.Acct.PasskeyRegisterBegin(ctx, u, req.GetPassword())
+	if err != nil {
+		return nil, toErr(err)
+	}
+	return &identityv1.BeginMyPasskeyResponse{CeremonyId: id, OptionsJson: string(options)}, nil
+}
+
+func (s *Service) FinishMyPasskey(ctx context.Context, req *identityv1.FinishMyPasskeyRequest) (*identityv1.FinishMyPasskeyResponse, error) {
+	u, err := s.myUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	p, err := s.Acct.PasskeyRegisterFinish(ctx, u, req.GetCeremonyId(), []byte(req.GetCredentialJson()), req.GetName())
+	if err != nil {
+		return nil, toErr(err)
+	}
+	return &identityv1.FinishMyPasskeyResponse{Passkey: passkeyMsg(*p)}, nil
+}
+
+func (s *Service) RenameMyPasskey(ctx context.Context, req *identityv1.RenameMyPasskeyRequest) (*identityv1.RenameMyPasskeyResponse, error) {
+	u, err := s.myUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.Acct.RenamePasskey(ctx, u, req.GetId(), req.GetName()); err != nil {
+		return nil, toErr(err)
+	}
+	return &identityv1.RenameMyPasskeyResponse{}, nil
+}
+
+func (s *Service) DeleteMyPasskey(ctx context.Context, req *identityv1.DeleteMyPasskeyRequest) (*identityv1.DeleteMyPasskeyResponse, error) {
+	u, err := s.myUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.Acct.DeletePasskey(ctx, u, req.GetId(), req.GetPassword()); err != nil {
+		return nil, toErr(err)
+	}
+	return &identityv1.DeleteMyPasskeyResponse{}, nil
+}

@@ -4,9 +4,11 @@ package notify
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"strings"
 	"time"
 
-	"github.com/huponx/gocommon/grpcclient"
+	"github.com/huponx/gocommon/notifyclient"
 	"github.com/huponx/identity/internal/appconfig"
 	courierv1 "github.com/huponx/protogen/go/courier/v1"
 	"go.uber.org/zap"
@@ -24,55 +26,118 @@ type Notifier interface {
 	// Welcome tells a new user to set the first password with link, valid for expiresIn.
 	Welcome(ctx context.Context, u User, link string, expiresIn time.Duration, tokenID string) error
 	// MFAChanged tells the user that MFA was turned on, off, enforced or reset; change is one of
-	// "enabled", "disabled", "enforced", "reset".
+	// "enabled", "disabled", "enforced", "reset", "recovery_regenerated".
 	MFAChanged(ctx context.Context, u User, change, eventID string) error
+	// RegistrationReceived tells an applicant that an administrator will review the request.
+	RegistrationReceived(ctx context.Context, u User, eventID string) error
+	// RegistrationRejected tells an applicant that the request was rejected.
+	RegistrationRejected(ctx context.Context, u User, eventID string) error
+	// RegistrationPending tells each admin about a request awaiting approval; adminURL (optional, the admin app) becomes a link to the applicant's user page.
+	RegistrationPending(ctx context.Context, admins []User, applicant User, adminURL, eventID string) error
 }
 
-// Courier sends through the courier gRPC API.
+// Courier sends through the courier gRPC API (gocommon/notifyclient).
 type Courier struct {
-	client courierv1.CourierServiceClient
+	client *notifyclient.Client
+	// LogoURL is the picture at the top of every HTML mail (a PNG on a public address: mail clients do not draw SVG);
+	// empty: the template draws a letter.
+	LogoURL string
+	// Brand is the name at the top of every mail (IDENTITY_MFA_ISSUER_NAME, the label of the authenticator apps).
+	Brand string
 }
 
 // NewCourier wraps a courier client.
-func NewCourier(c courierv1.CourierServiceClient) *Courier { return &Courier{client: c} }
+func NewCourier(c courierv1.CourierServiceClient) *Courier {
+	return &Courier{client: notifyclient.New(c)}
+}
 
-func (c *Courier) send(ctx context.Context, u User, template, key string, data map[string]string) error {
-	data["name"] = u.Name
-	_, err := c.client.SendNotification(ctx, &courierv1.SendNotificationRequest{
-		IdempotencyKey: key,
-		Locale:         u.Locale,
-		TemplateId:     template,
-		TemplateData:   data,
-		Recipients:     []*courierv1.Recipient{{Channel: courierv1.Channel_CHANNEL_EMAIL, Address: u.Email}},
-	})
-	if err != nil {
-		return fmt.Errorf("courier %s: %w", template, err)
+func (c *Courier) base(data map[string]string) map[string]string {
+	if data == nil {
+		data = map[string]string{}
 	}
-	return nil
+	if c.Brand != "" {
+		data["brand"] = c.Brand
+	}
+	if c.LogoURL != "" {
+		data["logo_url"] = c.LogoURL
+	}
+	return data
+}
+
+func (c *Courier) notify(ctx context.Context, eventType, key string, ids []string, raw []notifyclient.Recipient, locale string, data map[string]string) error {
+	_, err := c.client.Notify(ctx, notifyclient.Request{
+		EventType: eventType, IdempotencyKey: key, UserIDs: ids, Recipients: raw, Locale: locale, Data: data,
+	})
+	return err
+}
+
+// send notifies one user by id: courier looks up the address, the name and the language in identity. A user without an id
+// (never the case for a stored user) is sent to by address.
+func (c *Courier) send(ctx context.Context, u User, eventType, key string, data map[string]string) error {
+	if u.ID == "" {
+		return c.sendRaw(ctx, u, eventType, key, data)
+	}
+	return c.notify(ctx, eventType, key, []string{u.ID}, nil, "", c.base(data))
+}
+
+// sendRaw sends to the address of u, for a user that identity no longer knows (a rejected applicant is deleted).
+// The name travels in the data because courier cannot look it up.
+func (c *Courier) sendRaw(ctx context.Context, u User, eventType, key string, data map[string]string) error {
+	data = c.base(data)
+	data["name"] = u.Name
+	return c.notify(ctx, eventType, key, nil,
+		[]notifyclient.Recipient{{Channel: courierv1.Channel_CHANNEL_EMAIL, Address: u.Email}}, u.Locale, data)
 }
 
 // PasswordReset implements Notifier.
 func (c *Courier) PasswordReset(ctx context.Context, u User, link string, expiresIn time.Duration, resetID string) error {
-	return c.send(ctx, u, "identity_password_reset", "identity-password-reset-"+resetID, map[string]string{
+	return c.send(ctx, u, "security.password_reset", "identity-password-reset-"+resetID, map[string]string{
 		"link": link, "expires_in": fmt.Sprintf("%d", int(expiresIn.Minutes())),
 	})
 }
 
 // Welcome implements Notifier. expires_in is in days.
 func (c *Courier) Welcome(ctx context.Context, u User, link string, expiresIn time.Duration, tokenID string) error {
-	return c.send(ctx, u, "identity_welcome", "identity-welcome-"+tokenID, map[string]string{
+	return c.send(ctx, u, "account.welcome", "identity-welcome-"+tokenID, map[string]string{
 		"link": link, "expires_in": fmt.Sprintf("%d", int(expiresIn.Hours()/24)),
 	})
 }
 
 // PasswordChanged implements Notifier.
 func (c *Courier) PasswordChanged(ctx context.Context, u User, eventID string) error {
-	return c.send(ctx, u, "identity_password_changed", "identity-password-changed-"+eventID, map[string]string{})
+	return c.send(ctx, u, "security.password_changed", "identity-password-changed-"+eventID, nil)
 }
 
 // MFAChanged implements Notifier.
 func (c *Courier) MFAChanged(ctx context.Context, u User, change, eventID string) error {
-	return c.send(ctx, u, "identity_mfa_changed", "identity-mfa-"+change+"-"+eventID, map[string]string{"change": change})
+	return c.send(ctx, u, "security.mfa_changed", "identity-mfa-"+change+"-"+eventID, map[string]string{"change": change})
+}
+
+// RegistrationReceived implements Notifier.
+func (c *Courier) RegistrationReceived(ctx context.Context, u User, eventID string) error {
+	return c.send(ctx, u, "account.registration_received", "identity-registration-received-"+eventID, nil)
+}
+
+// RegistrationRejected implements Notifier. The applicant is deleted before the mail, so it goes by address.
+func (c *Courier) RegistrationRejected(ctx context.Context, u User, eventID string) error {
+	return c.sendRaw(ctx, u, "account.registration_rejected", "identity-registration-rejected-"+eventID, nil)
+}
+
+// RegistrationPending implements Notifier: one event for all admins; courier resolves each admin and sends in
+// the admin's language.
+func (c *Courier) RegistrationPending(ctx context.Context, admins []User, applicant User, adminURL, eventID string) error {
+	if len(admins) == 0 {
+		return nil
+	}
+	data := map[string]string{"applicant_name": applicant.Name, "applicant_email": applicant.Email}
+	if adminURL != "" { // straight to the user's page, where Approve and Reject are
+		data["link"] = strings.TrimRight(adminURL, "/") + "/users/" + url.PathEscape(applicant.ID)
+	}
+	ids := make([]string, 0, len(admins))
+	for _, a := range admins {
+		ids = append(ids, a.ID)
+	}
+	return c.notify(ctx, "account.registration_pending", "identity-registration-pending-"+eventID, ids, nil, "", c.base(data))
 }
 
 // Log writes the mail to the log instead of sending it. It is for ENV=local only, because the
@@ -103,6 +168,26 @@ func (l Log) MFAChanged(_ context.Context, u User, change, _ string) error {
 	return nil
 }
 
+// RegistrationReceived implements Notifier.
+func (l Log) RegistrationReceived(_ context.Context, u User, _ string) error {
+	l.Logger.Info("registration received mail (local, not sent)", zap.String("to", u.Email))
+	return nil
+}
+
+// RegistrationRejected implements Notifier.
+func (l Log) RegistrationRejected(_ context.Context, u User, _ string) error {
+	l.Logger.Info("registration rejected mail (local, not sent)", zap.String("to", u.Email))
+	return nil
+}
+
+// RegistrationPending implements Notifier.
+func (l Log) RegistrationPending(_ context.Context, admins []User, applicant User, _, _ string) error {
+	for _, a := range admins {
+		l.Logger.Info("registration pending mail (local, not sent)", zap.String("to", a.Email), zap.String("applicant", applicant.Email))
+	}
+	return nil
+}
+
 // None drops every mail (courier not configured outside local).
 type None struct{ Logger *zap.Logger }
 
@@ -124,6 +209,18 @@ func (n None) PasswordChanged(_ context.Context, _ User, _ string) error { retur
 // MFAChanged implements Notifier.
 func (n None) MFAChanged(_ context.Context, _ User, _, _ string) error { return nil }
 
+// RegistrationReceived implements Notifier.
+func (n None) RegistrationReceived(_ context.Context, _ User, _ string) error { return nil }
+
+// RegistrationRejected implements Notifier.
+func (n None) RegistrationRejected(_ context.Context, _ User, _ string) error { return nil }
+
+// RegistrationPending implements Notifier.
+func (n None) RegistrationPending(_ context.Context, _ []User, _ User, _, _ string) error {
+	n.Logger.Warn("courier is not configured: registration pending mail dropped")
+	return nil
+}
+
 // Build picks the notifier of the configuration: courier when COURIER_TARGET is set, the log
 // for a local run without courier, nothing otherwise.
 func Build(ctx context.Context, cfg appconfig.Identity, log *zap.Logger) Notifier {
@@ -133,15 +230,12 @@ func Build(ctx context.Context, cfg appconfig.Identity, log *zap.Logger) Notifie
 		}
 		return None{Logger: log}
 	}
-	opts := []grpcclient.Option{grpcclient.WithLogger(log)}
-	if cfg.CourierTokenFile != "" {
-		opts = append(opts, grpcclient.WithBearerTokenFile(cfg.CourierTokenFile))
-	} else if cfg.CourierToken != "" {
-		opts = append(opts, grpcclient.WithBearerToken(cfg.CourierToken))
-	}
-	conn, err := grpcclient.Dial(ctx, cfg.CourierTarget, opts...)
+	client, _, err := notifyclient.Dial(ctx, notifyclient.DialConfig{Target: cfg.CourierTarget, TokenFile: cfg.CourierTokenFile, Logger: log})
 	if err != nil {
 		log.Fatal("courier", zap.Error(err))
 	}
-	return NewCourier(courierv1.NewCourierServiceClient(conn))
+	cc := &Courier{client: client}
+	cc.Brand = cfg.MFAIssuerName
+	cc.LogoURL = strings.TrimRight(cfg.Issuer, "/") + "/logo-mail.png"
+	return cc
 }

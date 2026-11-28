@@ -4,7 +4,6 @@ import (
 	"context"
 	"testing"
 
-	"github.com/huponx/gocommon/grpcserver"
 	identityv1 "github.com/huponx/protogen/go/identity/v1"
 )
 
@@ -34,11 +33,11 @@ func TestSetUIStyleRejectsUnknown(t *testing.T) {
 
 // Reading the look needs only a session, changing it needs the settings permission.
 func TestUIStylePermissions(t *testing.T) {
-	if got := Permissions["/identity.v1.IdentityService/GetUIStyle"]; got != grpcserver.Public {
-		t.Errorf("GetUIStyle: %q", got)
+	if got := Permissions["/identity.v1.IdentityService/GetUIStyle"]; !got.Public {
+		t.Errorf("GetUIStyle: %+v", got)
 	}
-	if got := Permissions["/identity.v1.IdentityService/SetUIStyle"]; got != "identity:settings:write" {
-		t.Errorf("SetUIStyle: %q", got)
+	if got := Permissions["/identity.v1.IdentityService/SetUIStyle"]; !ruleIs(got, "identity:settings:write") {
+		t.Errorf("SetUIStyle: %+v", got)
 	}
 }
 
@@ -77,7 +76,7 @@ func TestPalettesOfFillsDefaults(t *testing.T) {
 	}
 	for k, v := range want {
 		if got[k] != v {
-			t.Errorf("%s: %q, want %q", k, got[k], v)
+			t.Errorf("%s: %q, want %+v", k, got[k], v)
 		}
 	}
 }

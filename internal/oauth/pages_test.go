@@ -29,7 +29,7 @@ func installUI(t *testing.T) string {
 	if err := os.MkdirAll(filepath.Join(dir, "assets"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for name, body := range map[string]string{"index.html": "<!doctype html><title>app</title>", "assets/app-1.js": "console.log(1)", "logo.svg": "<svg/>"} {
+	for name, body := range map[string]string{"index.html": "<!doctype html><title>app</title>", "assets/app-1.js": "console.log(1)", "logo.svg": "<svg/>", "logo-mail.png": "png"} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -52,7 +52,7 @@ func TestPagesServeTheApp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range []string{"/login", "/login/mfa", "/login/password", "/register", "/password/forgot", "/password/reset", "/account/mfa", "/apps", "/logout", "/error"} {
+	for _, p := range []string{"/login", "/login/mfa", "/login/password", "/register", "/password/forgot", "/password/reset", "/password/set", "/account/mfa", "/logout", "/error"} {
 		w := do(r, "GET", p, "", nil)
 		if w.Code != 200 || !strings.Contains(w.Body.String(), "<title>app</title>") {
 			t.Errorf("%s: %d %q", p, w.Code, w.Body.String())
@@ -76,6 +76,9 @@ func TestPagesServeTheApp(t *testing.T) {
 	}
 	if w := do(r, "GET", "/logo.svg", "", nil); w.Code != 200 {
 		t.Errorf("logo: %d", w.Code)
+	}
+	if w := do(r, "GET", "/logo-mail.png", "", nil); w.Code != 200 {
+		t.Errorf("mail logo: %d", w.Code)
 	}
 }
 
@@ -134,8 +137,8 @@ func TestAuthAPICSRF(t *testing.T) {
 			t.Errorf("%s without a session: %d %s", p, w.Code, w.Body.String())
 		}
 	}
-	if w := do(r, "GET", "/auth-api/apps", "", nil); w.Code != 401 {
-		t.Errorf("GET apps without a session: %d", w.Code)
+	if w := do(r, "GET", "/auth-api/session", "", nil); w.Code != 401 {
+		t.Errorf("GET session without a session: %d", w.Code)
 	}
 	if w := do(r, "GET", "/auth-api/account/mfa", "", nil); w.Code != 401 {
 		t.Errorf("GET account/mfa without a session: %d", w.Code)
@@ -143,16 +146,18 @@ func TestAuthAPICSRF(t *testing.T) {
 }
 
 func TestSafeReturn(t *testing.T) {
+	const portal = "https://portal.example"
+	s := New(Config{Issuer: "https://id.example", PortalURL: portal}, nil, nil, nil, nil, nil, zap.NewNop())
 	for in, want := range map[string]string{
-		"":                               "/apps",
-		"/oauth2/authorize?client_id=x":  "/oauth2/authorize?client_id=x",
-		"/account/mfa?return_to=%2Fapps": "/account/mfa?return_to=%2Fapps",
-		"/apps":                          "/apps",
-		"//evil.example/apps":            "/apps",
-		"https://evil.example/":          "/apps",
-		"/apps\\evil":                    "/apps",
+		"":                              portal,
+		"/oauth2/authorize?client_id=x": "/oauth2/authorize?client_id=x",
+		"/account/mfa?return_to=%2F":    "/account/mfa?return_to=%2F",
+		"/apps":                         portal,
+		"//evil.example/apps":           portal,
+		"https://evil.example/":         portal,
+		"/oauth2/authorize?a\\evil":     portal,
 	} {
-		if got := safeReturn(in); got != want {
+		if got := s.safeReturn(in); got != want {
 			t.Errorf("safeReturn(%q) = %q, want %q", in, got, want)
 		}
 	}

@@ -32,6 +32,11 @@ var apiMessages = map[string]string{
 	"csrf_expired":             "The form expired. Please try again.",
 	"rate_limited":             "Too many attempts. Please wait a few minutes.",
 	"invalid_credentials":      "Wrong e-mail or password.",
+	"invalid_password":         "Wrong password.",
+	"invalid_passkey":          "The passkey was not accepted. Try again or use another way to sign in.",
+	"invalid_passkey_name":     "The name must have 1 to 60 characters.",
+	"passkey_limit":            "You have reached the maximum number of passkeys.",
+	"passkey_not_found":        "This passkey does not exist.",
 	"invalid_code":             "Wrong code. Check the clock of your device and try again.",
 	"invalid_mfa_code":         "Wrong code.",
 	"invalid_password_or_code": "Wrong password or code.",
@@ -109,6 +114,10 @@ func (s *Server) authAPI(r *gin.Engine) {
 	a.POST("/login", s.apiLogin)
 	a.GET("/login/mfa", s.apiMFACheck)
 	a.POST("/login/mfa", s.apiMFA)
+	a.POST("/login/mfa/passkey/begin", s.apiMFAPasskeyBegin)
+	a.POST("/login/mfa/passkey/finish", s.apiMFAPasskeyFinish)
+	a.POST("/passkey/login/begin", s.apiPasskeyLoginBegin)
+	a.POST("/passkey/login/finish", s.apiPasskeyLoginFinish)
 	a.GET("/login/password", s.apiPasswordChangeCheck)
 	a.POST("/login/password", s.apiPasswordChange)
 
@@ -120,26 +129,26 @@ func (s *Server) authAPI(r *gin.Engine) {
 	a.GET("/account/mfa", s.apiAccountMFA)
 	a.POST("/account/mfa", s.apiAccountMFAConfirm)
 	a.POST("/account/mfa/disable", s.apiAccountMFADisable)
+	a.GET("/account/passkeys", s.apiPasskeyList)
+	a.POST("/account/passkeys/begin", s.apiPasskeyAddBegin)
+	a.POST("/account/passkeys/finish", s.apiPasskeyAddFinish)
+	a.PATCH("/account/passkeys/:id", s.apiPasskeyRename)
+	a.DELETE("/account/passkeys/:id", s.apiPasskeyDelete)
 
 	a.POST("/logout", s.apiLogout)
-	a.GET("/apps", s.apiApps)
+	a.GET("/session", s.apiSession)
 	a.GET("/ui-style", s.apiUIStyle)
 	a.GET("/preferences", s.apiPreferences)
 	a.POST("/preferences", s.apiSetPreferences)
 }
 
-// apiApps lists the applications of the signed in user's landing page (and whether the link to the MFA page is shown: only for an account that must use MFA and has not set it up yet).
-func (s *Server) apiApps(c *gin.Context) {
-	_, user, _ := s.sessionFrom(c)
-	if user == nil {
+// apiSession tells the login page whether somebody is signed in already: 401 without a session, else where to go.
+func (s *Server) apiSession(c *gin.Context) {
+	if _, user, _ := s.sessionFrom(c); user == nil {
 		s.apiError(c, http.StatusUnauthorized, "unauthenticated")
 		return
 	}
-	apps := s.cfg.Apps
-	if apps == nil {
-		apps = []appconfig.AppLink{}
-	}
-	c.JSON(http.StatusOK, gin.H{"apps": apps, "name": user.Name, "email": user.Email, "theme": user.Theme, "mfa": s.cfg.MFAMode != appconfig.MFAOff && s.acct.MFAForced(user) && !user.MFAEnabled})
+	c.JSON(http.StatusOK, gin.H{"redirect": s.cfg.PortalURL})
 }
 
 // apiUIStyle answers the look of the web apps and the palette of each look (set by an administrator for the whole
@@ -165,7 +174,16 @@ func (s *Server) apiUIStyle(c *gin.Context) {
 			palettes[st] = p
 		}
 	}
-	c.JSON(http.StatusOK, gin.H{"uiStyle": style, "uiPalettes": palettes, "registration": s.cfg.RegistrationEnabled})
+	// whether a new account waits for an administrator (the register page says so); true when unknown
+	approval := true
+	if s.store != nil {
+		if v, err := s.store.RegistrationRequiresApproval(c.Request.Context()); err == nil {
+			approval = v
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"uiStyle": style, "uiPalettes": palettes, "registration": s.cfg.RegistrationEnabled, "registrationApproval": approval,
+		// whether the sign in page offers passkeys
+		"passkeys": s.acct != nil && s.acct.PasskeysEnabled()})
 }
 
 // apiPreferences answers the theme and the language of the signed in user's account, which the pages keep in step with the apps.
@@ -218,7 +236,7 @@ func (s *Server) apiLogin(c *gin.Context) {
 	if !s.readJSON(c, &req) {
 		return
 	}
-	ret := safeReturn(req.ReturnTo)
+	ret := s.safeReturn(req.ReturnTo)
 	user, err := s.acct.PasswordLogin(ctx, req.Email, req.Password, c.ClientIP())
 	switch {
 	case errors.Is(err, account.ErrRateLimited):
@@ -234,12 +252,7 @@ func (s *Server) apiLogin(c *gin.Context) {
 
 	s.keepPreferences(c, user, req.Theme, req.Locale)
 
-	// a login always starts a new session (no session fixation)
-	if _, _, old := s.sessionFrom(c); old != "" {
-		if sess, err := s.state.GetSession(ctx, old, s.cfg.SessionIdle, s.cfg.SessionAbsolute); err == nil {
-			_, _ = s.acct.EndSession(ctx, sess.PublicID)
-		}
-	}
+	s.endOldSession(c) // a login always starts a new session (no session fixation)
 
 	if user.MustChangePassword {
 		// the password was set by somebody else: no session until the user chose their own
@@ -258,6 +271,16 @@ func (s *Server) apiLogin(c *gin.Context) {
 	}
 	// the theme of the account: the app keeps it for the next visit of the pages (they are another origin than the apps)
 	c.JSON(http.StatusOK, gin.H{"redirect": to, "theme": user.Theme, "locale": user.Locale})
+}
+
+// endOldSession ends the session the browser still has, before a sign in creates a new one.
+func (s *Server) endOldSession(c *gin.Context) {
+	ctx := c.Request.Context()
+	if _, _, old := s.sessionFrom(c); old != "" {
+		if sess, err := s.state.GetSession(ctx, old, s.cfg.SessionIdle, s.cfg.SessionAbsolute); err == nil {
+			_, _ = s.acct.EndSession(ctx, sess.PublicID)
+		}
+	}
 }
 
 var (
@@ -286,11 +309,24 @@ func (s *Server) keepPreferences(c *gin.Context, user *store.User, theme, locale
 
 // apiMFACheck tells whether the challenge `c` of the second factor still exists.
 func (s *Server) apiMFACheck(c *gin.Context) {
-	if ch, err := s.state.PeekChallenge(c.Request.Context(), c.Query("c")); err != nil || ch.Purpose != "" {
+	ctx := c.Request.Context()
+	ch, err := s.state.PeekChallenge(ctx, c.Query("c"))
+	if err != nil || ch.Purpose != "" {
 		s.apiError(c, http.StatusNotFound, "challenge_expired")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{})
+	// which second factors the user has: the page shows the code field, the passkey button, or both
+	user, err := s.store.UserByID(ctx, ch.UserID)
+	if err != nil || user.Disabled {
+		s.apiError(c, http.StatusNotFound, "challenge_expired")
+		return
+	}
+	totp, passkeys, err := s.acct.MFAMethods(ctx, user)
+	if err != nil {
+		s.apiFail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"totp": totp, "passkey": passkeys})
 }
 
 func (s *Server) apiMFA(c *gin.Context) {
@@ -336,21 +372,25 @@ func (s *Server) apiMFA(c *gin.Context) {
 		return
 	}
 	_ = s.state.DeleteChallenge(ctx, req.C)
+	s.finishMFA(c, user, ch, []string{"otp"})
+}
 
-	if ch.SessionID == "" { // login: the session is created now, after both factors
-		if err := s.startSession(c, user.ID, []string{"pwd", "otp"}); err != nil {
+// finishMFA ends the second factor step: a login gets its session now (after both factors), a step-up
+// upgrades the current one. methods are what the factor adds to the amr.
+func (s *Server) finishMFA(c *gin.Context, user *store.User, ch *state.Challenge, methods []string) {
+	if ch.SessionID == "" {
+		if err := s.startSession(c, user.ID, append([]string{"pwd"}, methods...)); err != nil {
 			s.apiFail(c, err)
 			return
 		}
-		next(c, safeReturn(ch.ReturnTo))
+		next(c, s.safeReturn(ch.ReturnTo))
 		return
 	}
-	// step-up of the current session
-	if err := s.upgradeSession(c); err != nil {
+	if err := s.upgradeSession(c, methods...); err != nil {
 		s.apiFail(c, err)
 		return
 	}
-	next(c, safeReturn(ch.ReturnTo))
+	next(c, s.safeReturn(ch.ReturnTo))
 }
 
 // ---- forced password change at login ----
@@ -412,7 +452,7 @@ func (s *Server) apiPasswordChange(c *gin.Context) {
 		s.apiFail(c, err)
 		return
 	}
-	to, err := s.continueLogin(c, user, safeReturn(ch.ReturnTo))
+	to, err := s.continueLogin(c, user, s.safeReturn(ch.ReturnTo))
 	if err != nil {
 		s.apiFail(c, err)
 		return
@@ -555,7 +595,8 @@ func (s *Server) apiAccountMFA(c *gin.Context) {
 		s.apiFail(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"enabled": false, "qr": enr.QRData, "secret": enr.Secret})
+	// forced: the user cannot go on without a second factor (the page offers a way out, not a way back)
+	c.JSON(http.StatusOK, gin.H{"enabled": false, "forced": s.acct.MFAForced(user), "qr": enr.QRData, "secret": enr.Secret})
 }
 
 func (s *Server) apiAccountMFAConfirm(c *gin.Context) {
@@ -587,7 +628,7 @@ func (s *Server) apiAccountMFAConfirm(c *gin.Context) {
 			s.apiFail(c, err)
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"recoveryCodes": codes, "redirect": safeReturn(req.ReturnTo)})
+		c.JSON(http.StatusOK, gin.H{"recoveryCodes": codes, "redirect": s.safeReturn(req.ReturnTo)})
 	}
 }
 

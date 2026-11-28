@@ -23,6 +23,7 @@ import (
 	"github.com/huponx/identity/internal/mfa"
 	"github.com/huponx/identity/internal/notify"
 	"github.com/huponx/identity/internal/oauth"
+	"github.com/huponx/identity/internal/passkey"
 	"github.com/huponx/identity/internal/service"
 	"github.com/huponx/identity/internal/state"
 	"github.com/huponx/identity/internal/store"
@@ -51,10 +52,16 @@ func main() {
 		log.Fatal("postgres", zap.Error(err))
 	}
 	defer st.Close()
+	// the catalog of permissions must match the code before identity serves anybody: a changed permission set
+	// changes what many users may do, so a failure stops the start (the old pods keep serving the old set)
+	if err := service.SyncOwnPermissions(ctx, st, log); err != nil {
+		log.Fatal("permission sync", zap.Error(err))
+	}
 	sta, err := state.New(ctx, cfg.Redis.URL())
 	if err != nil {
 		log.Fatal("redis", zap.Error(err))
 	}
+	sta.LimitFactor = cfg.RateLimitFactor
 	defer sta.Close()
 
 	keySet, err := keys.Load(cfg.SigningKeyFile, cfg.SigningKeyID, cfg.PreviousKeysDir)
@@ -74,10 +81,18 @@ func main() {
 	}, keySet, st, sta)
 
 	notifier := notify.Build(ctx, cfg, log)
+	var passkeys *passkey.Service
+	if cfg.WebAuthnEnabled {
+		if passkeys, err = passkey.New(passkey.Config{RPID: cfg.WebAuthnRP(), RPName: cfg.WebAuthnName(), Origins: cfg.WebAuthnOriginList()}); err != nil {
+			log.Fatal("webauthn", zap.Error(err))
+		}
+		log.Info("passkeys are on", zap.String("rp_id", cfg.WebAuthnRP()), zap.Strings("origins", cfg.WebAuthnOriginList()))
+	}
 	acct := account.New(account.Config{
-		Issuer: cfg.Issuer, MFAMode: cfg.MFAMode, MFAIssuerName: cfg.MFAIssuerName,
+		Issuer: cfg.Issuer, MFAMode: cfg.MFAMode, MFAIssuerName: cfg.MFAIssuerName, AdminURL: cfg.AdminURL,
 		RevokeTTL: cfg.AccessTokenTTL + time.Minute,
 	}, st, sta, tokens, sealer, notifier, log)
+	acct.Passkeys = passkeys
 
 	// gRPC API: our own JWTs (aud identity) and, for local runs only, a static token
 	verifier, err := jwtx.NewVerifier(jwtx.VerifierConfig{Issuer: cfg.Issuer, Audience: cfg.AuthAudience, Keys: jwtx.StaticKeySet(keySet.Public)})
@@ -85,16 +100,16 @@ func main() {
 		log.Fatal("jwt verifier", zap.Error(err))
 	}
 	authFns := []grpcserver.AuthFunc{grpcserver.JWTAuth(verifier)}
-	if cfg.IsLocal() && cfg.S2SToken != "" {
-		authFns = append(authFns, grpcserver.BearerToken(cfg.S2SToken))
-	}
 	srv := grpcserver.New(
 		grpcserver.WithLogger(log),
 		grpcserver.WithReflection(cfg.IsLocal()),
 		grpcserver.WithAuth(grpcserver.AnyAuth(authFns...)),
 		grpcserver.WithMethodPermissions(service.Permissions),
 	)
-	identityv1.RegisterIdentityServiceServer(srv.GRPC, service.New(acct, st, sta, tokens, cfg.MFAMode))
+	idSvc := service.New(acct, st, sta, tokens, cfg.MFAMode)
+	idSvc.RegistrationEnabled = cfg.RegistrationEnabled
+	idSvc.Log = log
+	identityv1.RegisterIdentityServiceServer(srv.GRPC, idSvc)
 
 	// HTTP: OAuth 2.0 / OpenID Connect
 	gin.SetMode(gin.ReleaseMode)
@@ -105,15 +120,11 @@ func main() {
 		healthz.Check{Name: "postgres", Fn: st.Ping},
 		healthz.Check{Name: "redis", Fn: sta.Ping},
 	))
-	apps, err := cfg.AppLinks() // validated above
-	if err != nil {
-		panic(err)
-	}
 	web := oauth.New(oauth.Config{
 		Issuer: cfg.Issuer, SecureCookies: !cfg.IsLocal() || startsHTTPS(cfg.Issuer),
 		SessionIdle: cfg.SessionIdleTTL, SessionAbsolute: cfg.SessionAbsoluteTTL, MFAMode: cfg.MFAMode,
 		TrustedProxies: cfg.TrustedProxies, AccessTokenDefault: cfg.AccessTokenTTL, RefreshTokenTTL: cfg.RefreshTokenTTL,
-		UIDir: cfg.UIDir, RequireUI: !cfg.IsLocal(), Apps: apps,
+		UIDir: cfg.UIDir, RequireUI: !cfg.IsLocal(), PortalURL: cfg.PortalURL,
 		RegistrationEnabled: cfg.RegistrationEnabled, RegistrationRole: cfg.RegistrationRole,
 	}, acct, st, sta, tokens, keySet, log)
 	if err := web.Routes(router); err != nil {

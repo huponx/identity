@@ -2,8 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
-	"strings"
 	"testing"
 
 	"github.com/huponx/identity/internal/store"
@@ -12,51 +10,47 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func TestPermissionCatalogMethodsNeedPermissions(t *testing.T) {
-	want := map[string]string{
-		"ListPermissions":  "identity:permission:read",
-		"CreatePermission": "identity:permission:write",
-		"UpdatePermission": "identity:permission:write",
-		"DeletePermission": "identity:permission:write",
+func TestPermissionCatalogIsReadOnly(t *testing.T) {
+	if got := Permissions["/identity.v1.IdentityService/ListPermissions"]; !ruleIs(got, "identity:permission:read") {
+		t.Errorf("ListPermissions: %+v", got)
 	}
-	for m, perm := range want {
-		if got := Permissions["/identity.v1.IdentityService/"+m]; got != perm {
-			t.Errorf("%s: %q, want %q", m, got, perm)
+	if got := Permissions["/identity.v1.IdentityService/RegisterPermissions"]; !ruleIs(got, "identity:permission:register") {
+		t.Errorf("RegisterPermissions: %+v", got)
+	}
+	for _, m := range []string{"CreatePermission", "UpdatePermission", "DeletePermission"} {
+		if _, ok := Permissions["/identity.v1.IdentityService/"+m]; ok {
+			t.Errorf("%s must be gone: administrators only read the catalog", m)
 		}
 	}
 }
 
-func TestPermissionName(t *testing.T) {
-	if permissionName("a:b", "c:d") != "a:b" || permissionName("", "c:d") != "c:d" {
-		t.Fatal("the name wins, the gateway path parameter is the fallback")
-	}
-}
-
-func TestCheckDescription(t *testing.T) {
-	if checkDescription(strings.Repeat("x", maxPermissionDescription)) != nil {
-		t.Error("the limit itself is fine")
-	}
-	if checkDescription(strings.Repeat("x", maxPermissionDescription+1)) == nil {
-		t.Error("longer must fail")
+func TestDescribeWildcard(t *testing.T) {
+	for w, want := range map[string]string{
+		"*": "Everything, in every service", "identity:*": "Everything in identity",
+		"identity:*:read": "Every read permission in identity", "identity:user:*": "Every permission on user in identity",
+	} {
+		if got := describeWildcard(w); got != want {
+			t.Errorf("%s: %+v", w, got)
+		}
 	}
 }
 
 func TestCatalogErrorsMapToCodes(t *testing.T) {
 	for err, code := range map[error]codes.Code{
-		store.ErrUnknownPermission: codes.InvalidArgument,
-		store.ErrPermissionInUse:   codes.FailedPrecondition,
-		store.ErrConflict:          codes.AlreadyExists,
+		store.ErrUnknownPermission:    codes.InvalidArgument,
+		store.ErrInvalidPermissionDef: codes.InvalidArgument,
+		store.ErrConflict:             codes.AlreadyExists,
 	} {
 		if got := status.Code(toErr(err)); got != code {
-			t.Errorf("%v: %v, want %v", errors.Unwrap(err), got, code)
+			t.Errorf("%v: %v, want %v", err, got, code)
 		}
 	}
 }
 
 func TestRoleMethodsAndErrors(t *testing.T) {
 	for _, m := range []string{"UpdateRole", "DeleteRole"} {
-		if got := Permissions["/identity.v1.IdentityService/"+m]; got != "identity:role:write" {
-			t.Errorf("%s: %q", m, got)
+		if got := Permissions["/identity.v1.IdentityService/"+m]; !ruleIs(got, "identity:role:write") {
+			t.Errorf("%s: %+v", m, got)
 		}
 	}
 	if got := status.Code(toErr(store.ErrRoleInUse)); got != codes.FailedPrecondition {
@@ -66,8 +60,8 @@ func TestRoleMethodsAndErrors(t *testing.T) {
 
 func TestClientMethodsAndErrors(t *testing.T) {
 	for _, m := range []string{"UpdateClient", "SetClientDisabled", "DeleteClient"} {
-		if got := Permissions["/identity.v1.IdentityService/"+m]; got != "identity:client:write" {
-			t.Errorf("%s: %q", m, got)
+		if got := Permissions["/identity.v1.IdentityService/"+m]; !ruleIs(got, "identity:client:write") {
+			t.Errorf("%s: %+v", m, got)
 		}
 	}
 	if got := status.Code(toErr(store.ErrClientNotDisabled)); got != codes.FailedPrecondition {
@@ -109,7 +103,7 @@ func TestClientTypeName(t *testing.T) {
 		identityv1.ClientType_CLIENT_TYPE_CONFIDENTIAL: "confidential",
 	} {
 		if got := clientTypeName(in); got != want {
-			t.Errorf("%v: %q", in, got)
+			t.Errorf("%v: %+v", in, got)
 		}
 	}
 }

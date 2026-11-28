@@ -15,13 +15,16 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/huponx/gocommon/grpcserver"
 	"github.com/huponx/identity/internal/appconfig"
 	"github.com/huponx/identity/internal/mfa"
 	"github.com/huponx/identity/internal/notify"
+	"github.com/huponx/identity/internal/passkey"
 	"github.com/huponx/identity/internal/password"
 	"github.com/huponx/identity/internal/state"
 	"github.com/huponx/identity/internal/store"
 	"github.com/huponx/identity/internal/token"
+	identityv1 "github.com/huponx/protogen/go/identity/v1"
 	"github.com/skip2/go-qrcode"
 	"go.uber.org/zap"
 )
@@ -36,6 +39,11 @@ var (
 	ErrMFAEnabled         = errors.New("account: mfa is already enabled")
 	ErrMFANotEnrolled     = errors.New("account: the user has not enrolled a second factor")
 	ErrMFAForced          = errors.New("account: mfa is required for this user")
+	// ErrAwaitingApproval is returned for a user whose registration an administrator has not approved: no link is
+	// sent to them and no reset works, or approval could be bypassed.
+	ErrAwaitingApproval = errors.New("account: the user is awaiting approval")
+	// ErrNotAwaitingApproval is returned by ApproveRegistration and RejectRegistration for another user.
+	ErrNotAwaitingApproval = errors.New("account: the user is not awaiting approval")
 )
 
 // Config is the part of the settings used here.
@@ -45,6 +53,7 @@ type Config struct {
 	MFAIssuerName string
 	ResetTTL      time.Duration // default 30 minutes
 	WelcomeTTL    time.Duration // validity of the set-password link of a new user, default 7 days
+	AdminURL      string        // link to the admin app in the mail to the approvers; "" omits it
 	// RevokeTTL is how long the per-user token cutoff is kept: longer than any access token.
 	RevokeTTL time.Duration
 }
@@ -56,9 +65,11 @@ type Service struct {
 	State  *state.State
 	Tokens *token.Service
 	Sealer *mfa.Sealer // nil when MFA is off
-	Notify notify.Notifier
-	Log    *zap.Logger
-	HTTP   *http.Client
+	// Passkeys is nil when passkeys are turned off (IDENTITY_WEBAUTHN_ENABLED=false)
+	Passkeys *passkey.Service
+	Notify   notify.Notifier
+	Log      *zap.Logger
+	HTTP     *http.Client
 
 	wg  sync.WaitGroup
 	now func() time.Time
@@ -174,18 +185,28 @@ const (
 	Enroll             // the user must set up a second factor first
 )
 
-// MFARequirement applies the server mode and the flags of the user.
-func (s *Service) MFARequirement(u *store.User) Requirement {
+// MFARequirement applies the server mode and the flags of the user. A TOTP device is always asked for after the
+// password. A passkey is not: signing in with the password stays a password sign in, and the passkey is a way in of its
+// own. Only when MFA is required (mode or enforced user) does it count as a second factor that can be verified, so such
+// a user with a passkey and no TOTP is asked for the passkey and is not sent to enroll.
+func (s *Service) MFARequirement(ctx context.Context, u *store.User) (Requirement, error) {
 	if s.Cfg.MFAMode == appconfig.MFAOff {
-		return NoMFA
+		return NoMFA, nil
 	}
 	if u.MFAEnabled {
-		return Verify
+		return Verify, nil
 	}
-	if s.Cfg.MFAMode == appconfig.MFARequired || u.MFAEnforced {
-		return Enroll
+	if !s.MFAForced(u) {
+		return NoMFA, nil
 	}
-	return NoMFA
+	_, passkeys, err := s.MFAMethods(ctx, u)
+	if err != nil {
+		return NoMFA, err
+	}
+	if passkeys {
+		return Verify, nil
+	}
+	return Enroll, nil
 }
 
 // MFAForced reports that the user cannot turn MFA off.
@@ -299,25 +320,59 @@ func (s *Service) VerifySecondFactor(ctx context.Context, u *store.User, code st
 		}
 		return false, ErrInvalidCode
 	}
+	return false, s.verifyTOTP(ctx, u, code)
+}
+
+// verifyTOTP accepts a code of the authenticator app; a TOTP step is accepted once.
+func (s *Service) verifyTOTP(ctx context.Context, u *store.User, code string) error {
 	_, secret, err := s.openFactor(ctx, u.ID)
 	if errors.Is(err, store.ErrNotFound) {
-		return false, ErrInvalidCode
+		return ErrInvalidCode
 	}
 	if err != nil {
-		return false, err
+		return err
 	}
 	step, matched := mfa.Match(secret, code, s.now())
 	if !matched {
-		return false, ErrInvalidCode
+		return ErrInvalidCode
 	}
 	fresh, err := s.Store.AdvanceMFAStep(ctx, u.ID, step)
 	if err != nil {
-		return false, err
+		return err
 	}
 	if !fresh {
-		return false, ErrInvalidCode // the code was already used
+		return ErrInvalidCode // the code was already used
 	}
-	return false, nil
+	return nil
+}
+
+// RegenerateRecoveryCodes replaces the recovery codes of the user after the password and a code of the authenticator
+// app. A recovery code is not accepted: it would be spent just before it is replaced. The new codes are shown once.
+func (s *Service) RegenerateRecoveryCodes(ctx context.Context, u *store.User, pw, code string) ([]string, error) {
+	if !u.MFAEnabled {
+		return nil, ErrMFANotEnrolled
+	}
+	if ok, err := s.State.Allow(ctx, "mfa:regen:"+u.ID, 10, 10*time.Minute); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, ErrRateLimited
+	}
+	if !password.Verify(pw, u.PasswordHash) {
+		return nil, ErrInvalidCredentials
+	}
+	if err := s.verifyTOTP(ctx, u, code); err != nil {
+		return nil, err
+	}
+	codes := mfa.RecoveryCodes(10)
+	hashes := make([][]byte, len(codes))
+	for i, c := range codes {
+		hashes[i] = password.Digest(c)
+	}
+	if err := s.Store.ReplaceRecoveryCodes(ctx, u.ID, hashes); err != nil {
+		return nil, err
+	}
+	s.mailMFA(u, "recovery_regenerated")
+	return codes, nil
 }
 
 // DisableMFA turns MFA off for the user after checking the password and a second factor.
@@ -351,9 +406,13 @@ func (s *Service) AdminDisableMFA(ctx context.Context, u *store.User) error {
 	return nil
 }
 
-// AdminResetMFA deletes the factor of a user who lost the device, and ends their sessions.
+// AdminResetMFA deletes the factor and the passkeys of a user who lost the device, and ends their sessions.
 func (s *Service) AdminResetMFA(ctx context.Context, u *store.User) error {
 	if err := s.Store.ResetMFA(ctx, u.ID); err != nil {
+		return err
+	}
+	// a lost device may be the one that holds the passkeys
+	if _, err := s.Store.DeleteUserPasskeys(ctx, u.ID); err != nil {
 		return err
 	}
 	s.mailMFA(u, "reset")
@@ -379,8 +438,23 @@ func (s *Service) mailMFA(u *store.User, change string) {
 
 // ---- registration ----
 
-// Register creates the account of a visitor (no password) and sends the welcome mail with the link to set it. It
-// never says whether the e-mail was known: an existing account (or a rate limited address) is answered like a new one,
+// ApprovePermission is held by the users who decide on self-registrations; they get the mail about a new request.
+var ApprovePermission = declared("identity:user:approve")
+
+// declared returns the name if permissions.proto declares it, and panics at start otherwise: the constant cannot
+// drift from the declaration.
+func declared(name string) string {
+	for _, d := range grpcserver.DeclaredPermissions(identityv1.File_identity_v1_permissions_proto) {
+		if d.Name == name {
+			return name
+		}
+	}
+	panic("account: " + name + " is not declared in identity/v1/permissions.proto")
+}
+
+// Register creates the account of a visitor (no password). Without the approval setting it sends the welcome mail
+// with the link to set the password; with it the account waits for an administrator and the applicant and the
+// approvers get a mail instead. It never says whether the e-mail was known: an existing account (or a rate limited address) is answered like a new one,
 // and nothing is sent to it. Only the limit per client IP is reported, which tells nothing about any account.
 func (s *Service) Register(ctx context.Context, u store.User, roles []string, ip string) error {
 	u.Email = store.NormalizeEmail(u.Email)
@@ -395,6 +469,11 @@ func (s *Service) Register(ctx context.Context, u store.User, roles []string, ip
 		s.Log.Warn("registration rate limited", zap.String("key", "register:email"))
 		return nil
 	}
+	needsApproval, err := s.Store.RegistrationRequiresApproval(ctx)
+	if err != nil {
+		return err
+	}
+	u.PendingApproval = needsApproval
 	created, err := s.Store.CreateUser(ctx, u, roles)
 	if errors.Is(err, store.ErrConflict) {
 		return nil
@@ -402,7 +481,67 @@ func (s *Service) Register(ctx context.Context, u store.User, roles []string, ip
 	if err != nil {
 		return err
 	}
-	return s.SendWelcome(ctx, created)
+	if !needsApproval {
+		return s.SendWelcome(ctx, created)
+	}
+	s.mailRegistrationRequest(created)
+	return nil
+}
+
+// mailRegistrationRequest tells the applicant that the request arrived and the approvers that it waits.
+func (s *Service) mailRegistrationRequest(applicant *store.User) {
+	id := uuid.NewString()
+	user := mailUser(applicant)
+	s.background("registration received mail", func(ctx context.Context) error {
+		return s.Notify.RegistrationReceived(ctx, user, id)
+	})
+	s.background("registration pending mail", func(ctx context.Context) error {
+		approvers, err := s.Store.ListUsersWithPermission(ctx, ApprovePermission)
+		if err != nil {
+			return err
+		}
+		if len(approvers) == 0 {
+			s.Log.Warn("registration awaits approval but nobody may approve it", zap.String("applicant", applicant.ID))
+			return nil
+		}
+		admins := make([]notify.User, len(approvers))
+		for i := range approvers {
+			admins[i] = mailUser(&approvers[i])
+		}
+		return s.Notify.RegistrationPending(ctx, admins, user, s.Cfg.AdminURL, id)
+	})
+}
+
+// ApproveRegistration clears the flag of a user awaiting approval and sends the welcome mail with the link to set
+// the password.
+func (s *Service) ApproveRegistration(ctx context.Context, u *store.User) error {
+	if !u.PendingApproval {
+		return ErrNotAwaitingApproval
+	}
+	approved, err := s.Store.ApproveUser(ctx, u.ID)
+	if errors.Is(err, store.ErrNotFound) {
+		return ErrNotAwaitingApproval
+	}
+	if err != nil {
+		return err
+	}
+	return s.SendWelcome(ctx, approved)
+}
+
+// RejectRegistration deletes a user awaiting approval (the address is free to register again) and tells them.
+func (s *Service) RejectRegistration(ctx context.Context, u *store.User) error {
+	if !u.PendingApproval {
+		return ErrNotAwaitingApproval
+	}
+	if err := s.Store.DeleteUser(ctx, u.ID); err != nil {
+		return err
+	}
+	id := uuid.NewString()
+	user := mailUser(u)
+	s.background("registration rejected mail", func(ctx context.Context) error {
+		return s.Notify.RegistrationRejected(ctx, user, id)
+	})
+	return nil
 }
 
 // ---- password reset ----
@@ -426,7 +565,7 @@ func (s *Service) RequestReset(ctx context.Context, email, ip string) error {
 		}
 	}
 	u, err := s.Store.UserByEmail(ctx, email)
-	if errors.Is(err, store.ErrNotFound) || (err == nil && u.Disabled) {
+	if errors.Is(err, store.ErrNotFound) || (err == nil && (u.Disabled || u.PendingApproval)) {
 		return nil
 	}
 	if err != nil {
@@ -436,7 +575,12 @@ func (s *Service) RequestReset(ctx context.Context, email, ip string) error {
 }
 
 // SendReset sends a reset mail to a known user (admin API).
-func (s *Service) SendReset(ctx context.Context, u *store.User) error { return s.sendReset(ctx, u, "") }
+func (s *Service) SendReset(ctx context.Context, u *store.User) error {
+	if u.PendingApproval {
+		return ErrAwaitingApproval
+	}
+	return s.sendReset(ctx, u, "")
+}
 
 // ErrNotPending is returned by SendWelcome for a user who already has a password.
 var ErrNotPending = errors.New("account: the user already has a password")
@@ -444,10 +588,13 @@ var ErrNotPending = errors.New("account: the user already has a password")
 // SendWelcome sends the welcome mail with a link to set the first password (admin API). It is
 // for a user who has no password yet; the link lives Cfg.WelcomeTTL and replaces older links.
 func (s *Service) SendWelcome(ctx context.Context, u *store.User) error {
+	if u.PendingApproval {
+		return ErrAwaitingApproval
+	}
 	if u.PasswordHash != "" {
 		return ErrNotPending
 	}
-	link, id, err := s.issueLink(ctx, u, "", s.Cfg.WelcomeTTL)
+	link, id, err := s.issueLink(ctx, u, "", setPasswordPage, s.Cfg.WelcomeTTL)
 	if err != nil {
 		return err
 	}
@@ -457,18 +604,25 @@ func (s *Service) SendWelcome(ctx context.Context, u *store.User) error {
 	return nil
 }
 
+// The pages of the two links. Both take the same single-use token; the first password and a new one differ only in
+// the wording of the page.
+const (
+	setPasswordPage   = "/password/set"   // welcome mail
+	resetPasswordPage = "/password/reset" // forgot password, admin reset
+)
+
 // issueLink creates a single-use reset token valid for ttl and returns the link to the reset page.
-func (s *Service) issueLink(ctx context.Context, u *store.User, ip string, ttl time.Duration) (link, id string, err error) {
+func (s *Service) issueLink(ctx context.Context, u *store.User, ip, page string, ttl time.Duration) (link, id string, err error) {
 	tok := password.Random(32)
 	id, err = s.Store.CreatePasswordReset(ctx, u.ID, password.Digest(tok), ip, s.now().Add(ttl))
 	if err != nil {
 		return "", "", err
 	}
-	return strings.TrimRight(s.Cfg.Issuer, "/") + "/password/reset?token=" + url.QueryEscape(tok), id, nil
+	return strings.TrimRight(s.Cfg.Issuer, "/") + page + "?token=" + url.QueryEscape(tok), id, nil
 }
 
 func (s *Service) sendReset(ctx context.Context, u *store.User, ip string) error {
-	link, id, err := s.issueLink(ctx, u, ip, s.Cfg.ResetTTL)
+	link, id, err := s.issueLink(ctx, u, ip, resetPasswordPage, s.Cfg.ResetTTL)
 	if err != nil {
 		return err
 	}
@@ -487,7 +641,14 @@ func (s *Service) ResetTokenUser(ctx context.Context, tok string) (*store.User, 
 	if err != nil {
 		return nil, err
 	}
-	return s.Store.UserByID(ctx, uid)
+	u, err := s.Store.UserByID(ctx, uid)
+	if err != nil {
+		return nil, err
+	}
+	if u.PendingApproval { // a token issued before the user was held back is no use either
+		return nil, ErrInvalidResetToken
+	}
+	return u, nil
 }
 
 // CompleteReset sets the new password. The token is consumed only after the policy accepted
@@ -506,12 +667,20 @@ func (s *Service) CompleteReset(ctx context.Context, tok, newPassword string) er
 		}
 		return err
 	}
-	return s.SetPassword(ctx, u, newPassword, false)
+	return s.setPassword(ctx, u, newPassword, false, mailPasswordChanged(u.PasswordHash != ""))
 }
 
 // SetPassword stores a new password and ends every session and token of the user. With
 // check, the policy is applied first (admin API); the reset flow already did.
 func (s *Service) SetPassword(ctx context.Context, u *store.User, newPassword string, check bool) error {
+	return s.setPassword(ctx, u, newPassword, check, true)
+}
+
+// mailPasswordChanged tells whether the "password changed" notice is sent: only when an
+// existing password is replaced, not when the first one is set (welcome link).
+func mailPasswordChanged(hadPassword bool) bool { return hadPassword }
+
+func (s *Service) setPassword(ctx context.Context, u *store.User, newPassword string, check, notify bool) error {
 	if check {
 		if err := password.Check(newPassword, u.Email, u.PasswordHash); err != nil {
 			return err
@@ -526,6 +695,9 @@ func (s *Service) SetPassword(ctx context.Context, u *store.User, newPassword st
 	}
 	if err := s.RevokeUserAccess(ctx, u.ID); err != nil {
 		return err
+	}
+	if !notify {
+		return nil
 	}
 	user := mailUser(u)
 	id := uuid.NewString()

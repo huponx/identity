@@ -242,7 +242,7 @@ func (s *Server) grantRefresh(c *gin.Context, cl *store.Client) (gin.H, error) {
 		scope = strings.Join(kept, " ")
 	}
 	acr := ""
-	if hasAMR(rt.AMR, "otp") {
+	if mfaDone(rt.AMR) {
 		acr = "mfa"
 	}
 	// the new refresh token stays in the family (only when offline_access is still in the scope)

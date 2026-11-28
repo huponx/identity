@@ -6,6 +6,7 @@ import "context"
 // "no password yet" is pending, the rest is active.
 type UserStats struct {
 	Total, Active, Pending, Disabled    int64
+	AwaitingApproval                    int64
 	MFAEnabled, MFAEnforced, WithAvatar int64
 	SignedIn30d, NeverSignedIn          int64
 	CreatedThisMonth                    int64
@@ -22,7 +23,8 @@ func (s *Store) UserStats(ctx context.Context) (*UserStats, error) {
 	err := s.pool.QueryRow(ctx, `SELECT
 		count(*),
 		count(*) FILTER (WHERE NOT disabled AND password_hash IS NOT NULL),
-		count(*) FILTER (WHERE NOT disabled AND password_hash IS NULL),
+		count(*) FILTER (WHERE NOT disabled AND password_hash IS NULL AND NOT pending_approval),
+		count(*) FILTER (WHERE NOT disabled AND pending_approval),
 		count(*) FILTER (WHERE disabled),
 		count(*) FILTER (WHERE mfa_enabled),
 		count(*) FILTER (WHERE mfa_enforced),
@@ -30,7 +32,7 @@ func (s *Store) UserStats(ctx context.Context) (*UserStats, error) {
 		count(*) FILTER (WHERE last_login_at > now() - interval '30 days'),
 		count(*) FILTER (WHERE last_login_at IS NULL),
 		count(*) FILTER (WHERE created_at >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
-		FROM identity_users WHERE deleted_at IS NULL`).Scan(&st.Total, &st.Active, &st.Pending, &st.Disabled,
+		FROM identity_users WHERE deleted_at IS NULL`).Scan(&st.Total, &st.Active, &st.Pending, &st.AwaitingApproval, &st.Disabled,
 		&st.MFAEnabled, &st.MFAEnforced, &st.WithAvatar, &st.SignedIn30d, &st.NeverSignedIn, &st.CreatedThisMonth)
 	if err != nil {
 		return nil, mapErr(err)

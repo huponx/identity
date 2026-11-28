@@ -16,7 +16,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/huponx/identity/internal/account"
-	"github.com/huponx/identity/internal/appconfig"
 	"github.com/huponx/identity/internal/keys"
 	"github.com/huponx/identity/internal/password"
 	"github.com/huponx/identity/internal/state"
@@ -33,8 +32,8 @@ type Config struct {
 	SessionIdle     time.Duration
 	SessionAbsolute time.Duration
 	MFAMode         string
-	// Apps are listed on /apps (IDENTITY_APPS).
-	Apps               []appconfig.AppLink
+	// PortalURL is where a signed in user goes when nobody sent them (IDENTITY_PORTAL_URL).
+	PortalURL          string
 	TrustedProxies     []string
 	AccessTokenDefault time.Duration
 	RefreshTokenTTL    time.Duration
@@ -76,7 +75,7 @@ func (s *Server) Routes(r *gin.Engine) error {
 	if err := r.SetTrustedProxies(s.cfg.TrustedProxies); err != nil {
 		return err
 	}
-	r.Use(securityHeaders(appconfig.IconOrigins(s.cfg.Apps)), limitBody(64<<10))
+	r.Use(securityHeaders(), limitBody(64<<10))
 
 	r.GET("/.well-known/openid-configuration", s.discovery)
 	r.GET("/.well-known/jwks.json", s.jwks)
@@ -107,16 +106,16 @@ func (s *Server) pages(r *gin.Engine) error {
 		}
 		s.log.Warn("the sign in pages are not installed (IDENTITY_UI_DIR has no index.html): the page paths answer 503", zap.String("dir", s.cfg.UIDir))
 	}
-	// the bare address: the applications for a signed in user, the sign in page for the others
+	// the bare address: the portal for a signed in user, the sign in page for the others
 	r.GET("/", func(c *gin.Context) {
 		if _, user, _ := s.sessionFrom(c); user != nil {
-			c.Redirect(http.StatusFound, "/apps")
+			c.Redirect(http.StatusFound, s.cfg.PortalURL)
 			return
 		}
 		c.Redirect(http.StatusFound, "/login")
 	})
 	// the page paths of the app; e-mailed links and return_to values use them
-	for _, p := range []string{"/login", "/login/mfa", "/login/password", "/register", "/password/forgot", "/password/reset", "/account/mfa", "/apps", "/logout", "/error"} {
+	for _, p := range []string{"/login", "/login/mfa", "/login/password", "/register", "/password/forgot", "/password/reset", "/password/set", "/account/mfa", "/logout", "/error"} {
 		r.GET(p, s.spa)
 	}
 	if s.index != nil {
@@ -126,7 +125,7 @@ func (s *Server) pages(r *gin.Engine) error {
 			c.Next()
 		})
 		assets.StaticFS("/", gin.Dir(filepath.Join(s.cfg.UIDir, "assets"), false)) // no directory listing
-		for _, f := range []string{"logo.svg", "theme-init.js"} {
+		for _, f := range []string{"logo.svg", "logo-mail.png", "theme-init.js"} {
 			path := filepath.Join(s.cfg.UIDir, f)
 			r.GET("/"+f, func(c *gin.Context) { c.File(path) })
 		}
@@ -201,8 +200,7 @@ func (s *Server) origin() string {
 
 // ---- middleware ----
 
-func securityHeaders(iconOrigins []string) gin.HandlerFunc {
-	img := strings.Join(append([]string{"'self'", "data:"}, iconOrigins...), " ")
+func securityHeaders() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		h := c.Writer.Header()
 		h.Set("Cache-Control", "no-store")
@@ -210,8 +208,8 @@ func securityHeaders(iconOrigins []string) gin.HandlerFunc {
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("X-Content-Type-Options", "nosniff") // existing standard header, not a new x- name
 		// the sign in app is script and style files of this origin (no inline code), its API is this origin, the
-		// QR code of the MFA enrollment is a data: image, the icons of the applications come from their origins
-		h.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; img-src "+img+"; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+		// QR code of the MFA enrollment is a data: image
+		h.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 		c.Next()
 	}
 }
@@ -233,11 +231,11 @@ func (s *Server) errorPage(c *gin.Context, code string) {
 }
 
 // safeReturn only accepts local paths we send people to, so return_to is never an open redirect.
-func safeReturn(rt string) string {
-	for _, p := range []string{"/oauth2/authorize?", "/account/mfa", "/apps"} {
+func (s *Server) safeReturn(rt string) string {
+	for _, p := range []string{"/oauth2/authorize?", "/account/mfa"} {
 		if strings.HasPrefix(rt, p) && !strings.ContainsAny(rt, "\\\r\n") && !strings.HasPrefix(rt, "//") {
 			return rt
 		}
 	}
-	return "/apps" // nobody sent the user here: the list of applications
+	return s.cfg.PortalURL // nobody sent the user here: the portal
 }
