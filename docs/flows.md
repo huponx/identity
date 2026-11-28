@@ -1027,7 +1027,7 @@ sequenceDiagram
 - `return_to` must be a UI origin and also registered as a post-logout URI of the client in identity.
 - `backchannelLogout` is called by identity (`account.backchannel`): `DeleteByIDPSession(sid)` when the
   token has `sid`, otherwise `DeleteBySubject(sub)`. The client in identity needs
-  `backchannel_logout_uri = <public url>/auth/backchannel-logout`. This is how a logout in
+  `backchannel_logout_uri = http://<gatekeeper service>:<service port>/auth/backchannel-logout` (the in-cluster address of the Service, e.g. `http://gatekeeper.application.svc:8080/...`; identity calls it directly, not through the ingress). This is how a logout in
   one application, a password reset or a disabled user ends the gatekeeper sessions right away.
 
 ### 10.8 CORS and origins

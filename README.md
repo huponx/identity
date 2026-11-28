@@ -76,6 +76,8 @@ Permissions are **defined by the services, in code**, not by administrators (the
 | `IDENTITY_REGISTRATION_ROLE` | `member` | role of a self-registered account (migration V36 creates it with the dictionary permissions) |
 | `IDENTITY_UI_DIR` | `/ui` | build of the sign in app (`web/apps/auth`; the image carries it). Required unless `ENV=local`, where the page paths answer 503 without it |
 | `COURIER_TARGET`, `COURIER_TOKEN_FILE` | empty | e-mails; empty disables them (links are logged when `ENV=local`) |
+| `COURIER_INSECURE` | `true` | plaintext gRPC to courier; `false` once courier serves TLS (CA: `GRPC_TLS_CA_FILE`) |
+| `GRPC_TLS_CERT_FILE`, `GRPC_TLS_KEY_FILE` | empty | serve the gRPC API (9090) over TLS, reloaded when the files change (cert-manager); clients of identity must then use `*_INSECURE=false` |
 | `POSTGRES_*`, `REDIS_*`, `HOST`, `ENV`, `LOG_*` | | gocommon blocks |
 
 MFA per user: with `optional` a user turns it on/off in `/account/mfa` (disabling asks for the password and a code); an admin can enforce, un-enforce, disable or reset it per user (in the admin app, or `SetUserMFA`/`EnforceUserMFA`/`ResetUserMFA` over gRPC). Recovery codes are shown once.
