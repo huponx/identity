@@ -24,6 +24,12 @@ application:
           secretName: identity-previous-keys
           optional: true
           defaultMode: 0440
+      # In-cluster gRPC TLS (certificate of cert-manager, see the TLS section of courier/docs/setup-notification.md).
+      # Optional: the pod starts without it, nothing reads it until GRPC_TLS_* / *_INSECURE=false are set.
+      - name: grpc-tls
+        secret:
+          secretName: identity-grpc-tls
+          optional: true
       - name: courier-token
         projected:
           sources:
@@ -82,6 +88,9 @@ application:
         - name: courier-token
           mountPath: /var/run/secrets/courier
           readOnly: true
+        - name: grpc-tls
+          mountPath: /var/run/tls
+          readOnly: true
   # Callers of the gRPC API present identity JWTs (client_credentials / token exchange, audience
   # identity), verified locally with the signing key: no TokenReview, no auth-delegator.
   serviceAccount:
@@ -103,6 +112,8 @@ application:
       IDENTITY_SIGNING_KEY_FILE: /var/run/identity/keys/signing.pem
       IDENTITY_PREVIOUS_KEYS_DIR: /var/run/identity/previous-keys
       COURIER_TOKEN_FILE: /var/run/secrets/courier/token
+      # the CA identity trusts when it dials courier with COURIER_INSECURE=false
+      GRPC_TLS_CA_FILE: /var/run/tls/ca.crt
   # Secret values stay out of git: reference existing Secrets (mm-deploy overrides this list).
   secrets: []
   # The ingress exposes the HTTP port only; mm-deploy sets host and TLS.

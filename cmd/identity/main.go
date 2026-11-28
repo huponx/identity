@@ -17,6 +17,7 @@ import (
 	"github.com/huponx/gocommon/httpx"
 	"github.com/huponx/gocommon/jwtx"
 	"github.com/huponx/gocommon/logging"
+	"github.com/huponx/gocommon/tlsconfig"
 	"github.com/huponx/identity/internal/account"
 	"github.com/huponx/identity/internal/appconfig"
 	"github.com/huponx/identity/internal/keys"
@@ -100,12 +101,21 @@ func main() {
 		log.Fatal("jwt verifier", zap.Error(err))
 	}
 	authFns := []grpcserver.AuthFunc{grpcserver.JWTAuth(verifier)}
-	srv := grpcserver.New(
+	grpcOpts := []grpcserver.Option{
 		grpcserver.WithLogger(log),
 		grpcserver.WithReflection(cfg.IsLocal()),
 		grpcserver.WithAuth(grpcserver.AnyAuth(authFns...)),
 		grpcserver.WithMethodPermissions(service.Permissions),
-	)
+	}
+	if st := cfg.ServerTLS(); st.Enabled() {
+		tc, err := tlsconfig.Server(st)
+		if err != nil {
+			log.Fatal("grpc tls", zap.Error(err))
+		}
+		grpcOpts = append(grpcOpts, grpcserver.WithTLS(tc))
+		log.Info("grpc serves TLS", zap.String("cert", st.CertFile))
+	}
+	srv := grpcserver.New(grpcOpts...)
 	idSvc := service.New(acct, st, sta, tokens, cfg.MFAMode)
 	idSvc.RegistrationEnabled = cfg.RegistrationEnabled
 	idSvc.Log = log
